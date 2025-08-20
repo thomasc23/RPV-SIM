@@ -1,0 +1,13 @@
+# Directories to ignore
+ARCHIVE/
+Neutral Redistricting/
+Output/
+Scripts/
+Simulated Shapefiles/
+Simulating Plans/
+Workflow/
+
+# Files to ignore
+sim_population_tc.R
+wasted_votes_analysis_may30.R
+
