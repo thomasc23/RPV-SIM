@@ -236,317 +236,125 @@ rank_match_assign = function(df_values, poly_scores) {
 # ======= PART 2: POPULATION GENERATION & PRECINCT ASSIGNMENT =======
 # ===================================================================
 
-# Balanced rounding to hit an exact total
-.balanced_round <- function(x, target_sum) {
-  y <- floor(x)
-  r <- target_sum - sum(y)
-  if (r > 0) {
-    o <- order(x - y, decreasing = TRUE)
-    y[o[seq_len(r)]] <- y[o[seq_len(r)]] + 1
-  } else if (r < 0) {
-    o <- order(x - y, decreasing = FALSE)
-    r <- -r
-    y[o[seq_len(r)]] <- pmax(0, y[o[seq_len(r)]] - 1)
-  }
-  y
-}
-
-# Generate precinct data with total and minority population counts (numeric-only)
-create_population_data = function(
-    n_precincts   = 2600,
-    input_data    = NULL,
-    # legacy-style means/sds (kept for back-compat)
-    pop_mean      = 2300,
-    pop_sd        = 1500,
-    minority_mean = 0.25,
-    minority_sd   = 0.30,
-    # ---- new realism knobs (all optional) ----
-    # cluster structure (set weights=1 to disable)
-    cluster_weights               = 1,                 # e.g., c(0.25, 0.5, 0.25)
-    cluster_pop_logmean           = log(pop_mean),     # e.g., log(c(6000, 2500, 900))
-    cluster_pop_logsd             = sqrt(log(1 + (pop_sd/pop_mean)^2)),
-    cluster_minority_logit_mean   = qlogis(minority_mean),
-    cluster_minority_logit_sd     = NULL,              # if NULL, derived from minority_sd
-    # correlation between size & share (log N vs logit p)
-    rho_pop_share = 0.0,                               # e.g., 0.35
-    # overdispersion: Beta–Binomial concentration (Inf ≈ Binomial)
-    kappa_bb = Inf,                                    # e.g., 60 for modest extra-binomial var
-    # extreme tails (near 0% / 100% minority)
-    zero_one_inflate = c(near0 = 0.0, near1 = 0.0),    # e.g., c(0.01, 0.01)
-    enclave_beta     = list(near0 = c(0.5, 60), near1 = c(60, 0.5)),
-    # exact calibration targets (optional)
-    target_state_minority_share = NULL,                # e.g., 0.32
-    target_total_pop            = NULL,                # e.g., 10_000_000
-    min_pop = 50,
-    seed    = 123
-) {
+# Generate precinct data with total and minority population counts
+create_population_data = function(n_precincts   = 2600,
+                                  input_data    = NULL,
+                                  pop_mean      = 2300,
+                                  pop_sd        = 1500,
+                                  minority_mean = 0.25,
+                                  minority_sd   = 0.30,
+                                  seed          = 123) {
   set.seed(seed)
-  
-  # ---------------------------
-  # Option 1: sample from input
-  # ---------------------------
+
   if (!is.null(input_data)) {
+    # Option 1: Sample from provided data
+    # Validate input
     required_cols = c("total_pop", "minority_pop")
     if (!all(required_cols %in% names(input_data))) {
       stop("input_data must contain columns: total_pop and minority_pop")
     }
+
+    # Sample precincts (with replacement if needed)
     if (nrow(input_data) >= n_precincts) {
-      idx = sample.int(nrow(input_data), n_precincts, replace = FALSE)
+      sampled_indices = sample(1:nrow(input_data), n_precincts, replace = FALSE)
     } else {
       warning(paste("Input data has", nrow(input_data), "rows but", n_precincts,
                     "precincts requested. Sampling with replacement."))
-      idx = sample.int(nrow(input_data), n_precincts, replace = TRUE)
+      sampled_indices = sample(1:nrow(input_data), n_precincts, replace = TRUE)
     }
-    populations     = as.integer(round(input_data$total_pop[idx]))
-    n_minority_vec  = as.integer(round(input_data$minority_pop[idx]))
-    n_majority_vec  = pmax(0L, populations - n_minority_vec)
-    per_minority    = ifelse(populations > 0, n_minority_vec / populations, 0)
+
+    # Extract populations
+    populations = input_data$total_pop[sampled_indices]
+    n_minority_vec = input_data$minority_pop[sampled_indices]
+
   } else {
-    # --------------------------------
-    # Option 2: simulate (numeric only)
-    # --------------------------------
-    
-    # Ensure cluster params have consistent length
-    K <- length(cluster_weights)
-    if (length(cluster_pop_logmean) != K)             cluster_pop_logmean         <- rep(cluster_pop_logmean, length.out = K)
-    if (length(cluster_pop_logsd)   != K)             cluster_pop_logsd           <- rep(cluster_pop_logsd,   length.out = K)
-    if (length(cluster_minority_logit_mean) != K)     cluster_minority_logit_mean <- rep(cluster_minority_logit_mean, length.out = K)
-    
-    # Derive a logit SD if not provided (delta method)
-    if (is.null(cluster_minority_logit_sd)) {
-      # approximate: sd_eta ≈ sd_p / (p*(1-p)) at each cluster mean
-      base_p   <- plogis(cluster_minority_logit_mean)
-      approx_s <- minority_sd / pmax(1e-6, base_p * (1 - base_p))
-      cluster_minority_logit_sd <- rep(approx_s, length.out = K)
-    } else if (length(cluster_minority_logit_sd) != K) {
-      cluster_minority_logit_sd <- rep(cluster_minority_logit_sd, length.out = K)
-    }
-    
-    # Draw cluster labels (no spatial meaning)
-    cluster <- sample.int(K, n_precincts, replace = TRUE, prob = cluster_weights)
-    
-    # Correlated normals for log-pop and logit-p
-    z1 <- rnorm(n_precincts)
-    z2 <- rnorm(n_precincts)
-    z2c <- rho_pop_share * z1 + sqrt(pmax(0, 1 - rho_pop_share^2)) * z2
-    
-    # Population sizes (lognormal per cluster)
-    mu_pop  <- cluster_pop_logmean[cluster]
-    sd_pop  <- cluster_pop_logsd[cluster]
-    log_pop <- mu_pop + sd_pop * z1
-    populations <- pmax(min_pop, as.integer(round(exp(log_pop))))
-    
-    # Minority share (logit-normal per cluster)
-    mu_logit <- cluster_minority_logit_mean[cluster]
-    sd_logit <- cluster_minority_logit_sd[cluster]
-    logit_p  <- mu_logit + sd_logit * z2c
-    p_raw    <- plogis(logit_p)
-    
-    # Optional zero/one inflation for realistic extremes
-    p <- p_raw
-    if (sum(zero_one_inflate) > 0) {
-      u  <- runif(n_precincts)
-      do0 <- u < zero_one_inflate[1]
-      do1 <- (!do0) & (u < sum(zero_one_inflate))
-      if (any(do0)) {
-        a <- enclave_beta$near0[1]; b <- enclave_beta$near0[2]
-        p[do0] <- rbeta(sum(do0), a, b)
-      }
-      if (any(do1)) {
-        a <- enclave_beta$near1[1]; b <- enclave_beta$near1[2]
-        p[do1] <- rbeta(sum(do1), a, b)
-      }
-    }
-    
-    # Optional statewide share calibration (expectation level)
-    if (!is.null(target_state_minority_share)) {
-      target <- target_state_minority_share
-      f <- function(delta) {
-        mean_w <- sum(populations * plogis(logit_p + delta)) / sum(populations)
-        mean_w - target
-      }
-      lo <- f(-12); hi <- f(12)
-      if (lo > 0 && hi > 0) {
-        delta_star <- -12; warning("Target minority share below feasible range; clamped.")
-      } else if (lo < 0 && hi < 0) {
-        delta_star <- 12;  warning("Target minority share above feasible range; clamped.")
-      } else {
-        delta_star <- uniroot(f, interval = c(-12, 12))$root
-      }
-      logit_p <- logit_p + delta_star
-      p <- plogis(logit_p)
-    }
-    
-    # Overdispersed counts via Beta–Binomial around p
-    if (is.finite(kappa_bb) && kappa_bb > 0) {
-      alpha <- p * kappa_bb
-      beta  <- (1 - p) * kappa_bb
-      pi_tilde <- rbeta(n_precincts, alpha, beta)
+    # Option 2: Simulate from distributions
+    # Generate populations from log-normal to get realistic right-skewed distribution
+    # Converting mean and sd to log-normal parameters
+    cv = pop_sd / pop_mean  # coefficient of variation
+    sigma = sqrt(log(1 + cv^2))
+    mu = log(pop_mean) - sigma^2/2
+
+    populations = round(rlnorm(n_precincts, meanlog = mu, sdlog = sigma))
+    populations = pmax(50, populations)  # Minimum population of 50
+
+    # Generate minority percentages from beta distribution
+    # This gives us values between 0 and 1 with specified mean and sd
+    # Converting mean and sd to beta parameters
+    var = minority_sd^2
+    alpha = minority_mean * (minority_mean * (1 - minority_mean) / var - 1)
+    beta = (1 - minority_mean) * (minority_mean * (1 - minority_mean) / var - 1)
+
+    # Ensure valid parameters
+    if (alpha <= 0 || beta <= 0) {
+      warning("Invalid minority distribution parameters. Using uniform distribution.")
+      per_minority = runif(n_precincts, 0, 1)
     } else {
-      pi_tilde <- p
+      per_minority = rbeta(n_precincts, alpha, beta)
     }
-    
-    # Draw counts
-    n_minority_vec <- rbinom(n_precincts, size = populations, prob = pi_tilde)
-    
-    # Optional exact total population calibration
-    if (!is.null(target_total_pop)) {
-      scaled <- (populations / sum(populations)) * target_total_pop
-      populations_new <- .balanced_round(scaled, target_total_pop)
-      # Keep composition by re-drawing at same pi_tilde on new N
-      n_minority_vec <- rbinom(n_precincts, size = populations_new, prob = pi_tilde)
-      populations <- populations_new
-    }
-    
-    n_majority_vec <- pmax(0L, populations - n_minority_vec)
-    per_minority   <- ifelse(populations > 0, n_minority_vec / populations, 0)
+
+    n_minority_vec = round(populations * per_minority)
   }
-  
-  # Assemble
+
+  # Calculate derived values
+  n_majority_vec = populations - n_minority_vec
+  per_minority = n_minority_vec / populations
+
+  # Create output dataframe
   precincts = data.frame(
-    precinct_id  = seq_len(n_precincts),
-    population   = as.integer(populations),
-    n_minority   = as.integer(n_minority_vec),
-    n_majority   = as.integer(n_majority_vec),
-    per_minority = as.numeric(per_minority)
+    precinct_id = 1:n_precincts,
+    population = populations,
+    n_minority = n_minority_vec,
+    n_majority = n_majority_vec,
+    per_minority = per_minority
   )
-  
-  # Shuffle to avoid ordering artifacts
-  precincts <- precincts[sample.int(n_precincts), ]
-  precincts$precinct_id <- seq_len(n_precincts)
-  
-  # Console summary
+
+  # Shuffle to avoid ordering effects
+  shuffle_order = sample(n_precincts)
+  precincts = precincts[shuffle_order, ]
+  precincts$precinct_id = 1:n_precincts
+
+  # Report summary statistics
   actual_minority_pct = sum(precincts$n_minority) / sum(precincts$population)
-  cat("\nGenerated", n_precincts, "precincts (numeric-only, no spatial)\n")
+  cat("\nGenerated", n_precincts, "precincts")
+  if (!is.null(input_data)) {
+    cat(" (sampled from input data)")
+  } else {
+    cat(" (simulated from distributions)")
+  }
+  cat("\n")
   cat("Total population:", format(sum(precincts$population), big.mark=","), "\n")
   cat("Mean precinct population:", round(mean(precincts$population)), "\n")
   cat("Overall minority %:", round(actual_minority_pct * 100, 2), "%\n")
   cat("Precincts with 0% minority:", sum(precincts$per_minority == 0), "\n")
   cat("Precincts with 100% minority:", sum(precincts$per_minority == 1), "\n")
-  
+
+  # # Create visualizations
+  # par(mfrow = c(2, 2))
+  #
+  # # Population distribution
+  # hist(precincts$population, breaks = 50, main = "Distribution of Population",
+  #      xlab = "Population", ylab = "Number of Precincts", col = "lightgreen")
+  #
+  # # Minority percentage distribution
+  # hist(precincts$per_minority, breaks = 50, main = "Distribution of Minority %",
+  #      xlab = "Minority Percentage", ylab = "Number of Precincts", col = "lightblue")
+  #
+  # # Population vs Minority % scatter
+  # plot(precincts$population, precincts$per_minority,
+  #      main = "Population vs Minority %",
+  #      xlab = "Population", ylab = "Minority %",
+  #      pch = 16, col = rgb(0, 0, 1, 0.3))
+  #
+  # # Cumulative distribution of minority %
+  # plot(ecdf(precincts$per_minority),
+  #      main = "Cumulative Distribution of Minority %",
+  #      xlab = "Minority %", ylab = "Cumulative Probability")
+  #
+  # par(mfrow = c(1, 1))
+
   return(precincts)
 }
-
-
-# # Generate precinct data with total and minority population counts 
-# create_population_data = function(n_precincts   = 2600,
-#                                   input_data    = NULL,
-#                                   pop_mean      = 2300,
-#                                   pop_sd        = 1500,
-#                                   minority_mean = 0.25,
-#                                   minority_sd   = 0.30,
-#                                   seed          = 123) {
-#   set.seed(seed)
-#   
-#   if (!is.null(input_data)) {
-#     # Option 1: Sample from provided data
-#     # Validate input
-#     required_cols = c("total_pop", "minority_pop")
-#     if (!all(required_cols %in% names(input_data))) {
-#       stop("input_data must contain columns: total_pop and minority_pop")
-#     }
-#     
-#     # Sample precincts (with replacement if needed)
-#     if (nrow(input_data) >= n_precincts) {
-#       sampled_indices = sample(1:nrow(input_data), n_precincts, replace = FALSE)
-#     } else {
-#       warning(paste("Input data has", nrow(input_data), "rows but", n_precincts, 
-#                     "precincts requested. Sampling with replacement."))
-#       sampled_indices = sample(1:nrow(input_data), n_precincts, replace = TRUE)
-#     }
-#     
-#     # Extract populations
-#     populations = input_data$total_pop[sampled_indices]
-#     n_minority_vec = input_data$minority_pop[sampled_indices]
-#     
-#   } else {
-#     # Option 2: Simulate from distributions
-#     # Generate populations from log-normal to get realistic right-skewed distribution
-#     # Converting mean and sd to log-normal parameters
-#     cv = pop_sd / pop_mean  # coefficient of variation
-#     sigma = sqrt(log(1 + cv^2))
-#     mu = log(pop_mean) - sigma^2/2
-#     
-#     populations = round(rlnorm(n_precincts, meanlog = mu, sdlog = sigma))
-#     populations = pmax(50, populations)  # Minimum population of 50
-#     
-#     # Generate minority percentages from beta distribution
-#     # This gives us values between 0 and 1 with specified mean and sd
-#     # Converting mean and sd to beta parameters
-#     var = minority_sd^2
-#     alpha = minority_mean * (minority_mean * (1 - minority_mean) / var - 1)
-#     beta = (1 - minority_mean) * (minority_mean * (1 - minority_mean) / var - 1)
-#     
-#     # Ensure valid parameters
-#     if (alpha <= 0 || beta <= 0) {
-#       warning("Invalid minority distribution parameters. Using uniform distribution.")
-#       per_minority = runif(n_precincts, 0, 1)
-#     } else {
-#       per_minority = rbeta(n_precincts, alpha, beta)
-#     }
-#     
-#     n_minority_vec = round(populations * per_minority)
-#   }
-#   
-#   # Calculate derived values
-#   n_majority_vec = populations - n_minority_vec
-#   per_minority = n_minority_vec / populations
-#   
-#   # Create output dataframe
-#   precincts = data.frame(
-#     precinct_id = 1:n_precincts,
-#     population = populations,
-#     n_minority = n_minority_vec,
-#     n_majority = n_majority_vec,
-#     per_minority = per_minority
-#   )
-#   
-#   # Shuffle to avoid ordering effects
-#   shuffle_order = sample(n_precincts)
-#   precincts = precincts[shuffle_order, ]
-#   precincts$precinct_id = 1:n_precincts
-#   
-#   # Report summary statistics
-#   actual_minority_pct = sum(precincts$n_minority) / sum(precincts$population)
-#   cat("\nGenerated", n_precincts, "precincts")
-#   if (!is.null(input_data)) {
-#     cat(" (sampled from input data)")
-#   } else {
-#     cat(" (simulated from distributions)")
-#   }
-#   cat("\n")
-#   cat("Total population:", format(sum(precincts$population), big.mark=","), "\n")
-#   cat("Mean precinct population:", round(mean(precincts$population)), "\n")
-#   cat("Overall minority %:", round(actual_minority_pct * 100, 2), "%\n")
-#   cat("Precincts with 0% minority:", sum(precincts$per_minority == 0), "\n")
-#   cat("Precincts with 100% minority:", sum(precincts$per_minority == 1), "\n")
-#   
-#   # # Create visualizations
-#   # par(mfrow = c(2, 2))
-#   # 
-#   # # Population distribution
-#   # hist(precincts$population, breaks = 50, main = "Distribution of Population",
-#   #      xlab = "Population", ylab = "Number of Precincts", col = "lightgreen")
-#   # 
-#   # # Minority percentage distribution
-#   # hist(precincts$per_minority, breaks = 50, main = "Distribution of Minority %",
-#   #      xlab = "Minority Percentage", ylab = "Number of Precincts", col = "lightblue")
-#   # 
-#   # # Population vs Minority % scatter
-#   # plot(precincts$population, precincts$per_minority, 
-#   #      main = "Population vs Minority %",
-#   #      xlab = "Population", ylab = "Minority %", 
-#   #      pch = 16, col = rgb(0, 0, 1, 0.3))
-#   # 
-#   # # Cumulative distribution of minority %
-#   # plot(ecdf(precincts$per_minority), 
-#   #      main = "Cumulative Distribution of Minority %",
-#   #      xlab = "Minority %", ylab = "Cumulative Probability")
-#   # 
-#   # par(mfrow = c(1, 1))
-#   
-#   return(precincts)
-# }
 
 # Assign votes
 add_voting_behavior = function(precincts,
