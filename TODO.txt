@@ -1,0 +1,11 @@
+TO-DO:
+
+Population Generation:
+- Test using real precinct input
+- Simplify/improve population generation
+
+Geographic Assignment:
+- voteshare not meaningfully spatially correlated when using minority status to fix location alone
+
+Ex Post Vote Models:
+- Vary true RPV, vote model after plans are drawn

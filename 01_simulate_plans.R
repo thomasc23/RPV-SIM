@@ -60,16 +60,23 @@ run_sim = function() {
   
   # Redistricting parameters
   N_PLANS            = 100 # Size of neutral map ensemble
-  ENSEMBLE_SIZE      = 50 # Size of biased map ensemble
+  ENSEMBLE_SIZE      = 20 # Size of biased map ensemble  
   POP_DEVIATION      = 0.01
+  
+  # ENSEMBLE_SIZE = 25–30
+  # BURST_LENGTH = 400
+  # NUM_BURSTS = 24 # planned steps = 9,600
+  # PATIENCE_BURSTS = 6
   
   # Short burst optimizer / dev parameters
   DEV_MODE            = TRUE
-  BURST_LENGTH        = 300   # steps per burst
-  NUM_BURSTS          = 20    # number of bursts (iterations)
+  BURST_LENGTH        = 150   # steps per burst
+  NUM_BURSTS          = 15    # number of bursts (iterations)
   PATIENCE_BURSTS     = 6     # optional early stop after N bad bursts
   SOFT_K              = 60    # (unchanged) steepness for soft seats
   SIMPLIFY_TOL        = NA    # numeric or NA
+  
+  SCORE_MODELS        = FALSE
   
   
   # Output directory
@@ -112,7 +119,8 @@ run_sim = function() {
     num_bursts         = NUM_BURSTS,
     patience_bursts    = PATIENCE_BURSTS,
     soft_k             = SOFT_K,
-    simplify_tolerance = SIMPLIFY_TOL
+    simplify_tolerance = SIMPLIFY_TOL,
+    score_models       = SCORE_MODELS
   )
   
   # Verify consistency
