@@ -213,13 +213,14 @@ create_realistic_grid = function(n_precincts     = 2600,
 simulate_sar_field = function(sf_obj, rho = 0.7, sd = 1.0) {
   nb  = suppressWarnings(spdep::poly2nb(sf_obj, queen = TRUE))
   lw  = spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
-  W   = spdep::listw2mat(lw)         # row-standardized
+  W   = spdep::listw2mat(lw)
   n   = nrow(W)
   I   = diag(n)
-  e   = rnorm(n, 0, sd)
-  # Solve (I - rho W) z = e  ⇒  z = (I - rho W)^(-1) e
+  e   = rnorm(n, 0, 1)                      # unit noise
   z   = as.numeric(solve(I - rho * W, e))
-  scale(z)
+  z   = as.numeric(scale(z))                # mean 0, sd 1
+  z[is.na(z)] = 0
+  z * sd                                     # respect requested sd
 }
 
 rank_match_assign = function(df_values, poly_scores) {
@@ -237,13 +238,14 @@ rank_match_assign = function(df_values, poly_scores) {
 # ===================================================================
 
 # Generate precinct data with total and minority population counts
-create_population_data = function(n_precincts   = 2600,
-                                  input_data    = NULL,
-                                  pop_mean      = 2300,
-                                  pop_sd        = 1500,
-                                  minority_mean = 0.25,
-                                  minority_sd   = 0.30,
-                                  seed          = 123) {
+create_population_data = function(n_precincts    = 2600,
+                                  input_data     = NULL,
+                                  pop_mean       = 2300,
+                                  pop_sd         = 1500,
+                                  minority_mean  = 0.25,
+                                  minority_sd    = 0.30,
+                                  rho_size_share = 0.25,
+                                  seed           = 123) {
   set.seed(seed)
 
   if (!is.null(input_data)) {
@@ -268,262 +270,214 @@ create_population_data = function(n_precincts   = 2600,
     n_minority_vec = input_data$minority_pop[sampled_indices]
 
   } else {
+    
     # Option 2: Simulate from distributions
-    # Generate populations from log-normal to get realistic right-skewed distribution
-    # Converting mean and sd to log-normal parameters
-    cv = pop_sd / pop_mean  # coefficient of variation
-    sigma = sqrt(log(1 + cv^2))
-    mu = log(pop_mean) - sigma^2/2
-
+    
+    cv          = pop_sd / pop_mean
+    sigma       = sqrt(log(1 + cv^2))
+    mu          = log(pop_mean) - sigma^2/2
     populations = round(rlnorm(n_precincts, meanlog = mu, sdlog = sigma))
-    populations = pmax(50, populations)  # Minimum population of 50
+    populations = pmax(50, populations) # Minimum population of 50
 
-    # Generate minority percentages from beta distribution
-    # This gives us values between 0 and 1 with specified mean and sd
-    # Converting mean and sd to beta parameters
-    var = minority_sd^2
-    alpha = minority_mean * (minority_mean * (1 - minority_mean) / var - 1)
-    beta = (1 - minority_mean) * (minority_mean * (1 - minority_mean) / var - 1)
-
-    # Ensure valid parameters
-    if (alpha <= 0 || beta <= 0) {
-      warning("Invalid minority distribution parameters. Using uniform distribution.")
-      per_minority = runif(n_precincts, 0, 1)
-    } else {
-      per_minority = rbeta(n_precincts, alpha, beta)
-    }
-
-    n_minority_vec = round(populations * per_minority)
+    # ------------------------------------------
+    # 2) MINORITY % with *monotone-decreasing* Beta
+    # ------------------------------------------
+    # Method-of-moments concentration (k), then CLAMP so that:
+    #   alpha = m*k  < 1  and  beta = (1-m)*k > 1  ⇒ density decreases smoothly from 0→1
+    m   = pmin(pmax(minority_mean, 0.01), 0.99)
+    v   = pmin(pmax(minority_sd^2, 1e-6), m*(1-m) - 1e-6)  # keep feasible
+    k0  = m*(1-m)/v - 1
+    k_lo= 1/(1-m) + 1e-6   # ensures beta > 1
+    k_hi= 1/m     - 1e-6   # ensures alpha < 1
+    k   = min(max(k0, k_lo), k_hi)
+    
+    alpha = m * k
+    beta  = (1 - m) * k
+    per_minority = rbeta(n_precincts, alpha, beta)
+    
+    # ------------------------------------------
+    # 3) Inject a mild size→share correlation
+    # ------------------------------------------
+    # Work on logit scale to keep (0,1) bounds.
+    logit  = function(p) { p = pmin(pmax(p, 1e-6), 1-1e-6); log(p/(1-p)) }
+    invlog = function(x) 1/(1+exp(-x))
+    
+    z_pop  = scale(log(populations))      # larger pop ⇒ larger z_pop
+    per_adj= invlog(logit(per_minority) + rho_size_share * as.numeric(z_pop))
+    
+    # Gentle multiplicative calibration back toward requested mean
+    eps    = 0.01
+    s      = m / mean(per_adj)            # keep overall level roughly on target
+    per_adj= pmin(pmax(per_adj * s, eps), 1 - eps)
+    
+    n_minority_vec = round(populations * per_adj)
   }
-
-  # Calculate derived values
-  n_majority_vec = populations - n_minority_vec
-  per_minority = n_minority_vec / populations
-
-  # Create output dataframe
+  
+  # ---------------------------
+  # 4) Assemble + report
+  # ---------------------------
+  n_majority_vec = pmax(0, populations - n_minority_vec)
+  per_minority   = n_minority_vec / populations
+  
   precincts = data.frame(
-    precinct_id = 1:n_precincts,
-    population = populations,
-    n_minority = n_minority_vec,
-    n_majority = n_majority_vec,
+    precinct_id  = 1:n_precincts,
+    population   = populations,
+    n_minority   = n_minority_vec,
+    n_majority   = n_majority_vec,
     per_minority = per_minority
   )
-
-  # Shuffle to avoid ordering effects
-  shuffle_order = sample(n_precincts)
-  precincts = precincts[shuffle_order, ]
+  
+  precincts = precincts[sample(n_precincts), ]
   precincts$precinct_id = 1:n_precincts
-
-  # Report summary statistics
+  
   actual_minority_pct = sum(precincts$n_minority) / sum(precincts$population)
-  cat("\nGenerated", n_precincts, "precincts")
-  if (!is.null(input_data)) {
-    cat(" (sampled from input data)")
-  } else {
-    cat(" (simulated from distributions)")
-  }
-  cat("\n")
+  cat("\nGenerated", n_precincts, "precincts (simulated)\n")
   cat("Total population:", format(sum(precincts$population), big.mark=","), "\n")
   cat("Mean precinct population:", round(mean(precincts$population)), "\n")
   cat("Overall minority %:", round(actual_minority_pct * 100, 2), "%\n")
   cat("Precincts with 0% minority:", sum(precincts$per_minority == 0), "\n")
   cat("Precincts with 100% minority:", sum(precincts$per_minority == 1), "\n")
 
-  # # Create visualizations
-  # par(mfrow = c(2, 2))
-  #
-  # # Population distribution
-  # hist(precincts$population, breaks = 50, main = "Distribution of Population",
-  #      xlab = "Population", ylab = "Number of Precincts", col = "lightgreen")
-  #
-  # # Minority percentage distribution
-  # hist(precincts$per_minority, breaks = 50, main = "Distribution of Minority %",
-  #      xlab = "Minority Percentage", ylab = "Number of Precincts", col = "lightblue")
-  #
-  # # Population vs Minority % scatter
-  # plot(precincts$population, precincts$per_minority,
-  #      main = "Population vs Minority %",
-  #      xlab = "Population", ylab = "Minority %",
-  #      pch = 16, col = rgb(0, 0, 1, 0.3))
-  #
-  # # Cumulative distribution of minority %
-  # plot(ecdf(precincts$per_minority),
-  #      main = "Cumulative Distribution of Minority %",
-  #      xlab = "Minority %", ylab = "Cumulative Probability")
-  #
-  # par(mfrow = c(1, 1))
+  # Create visualizations
+  par(mfrow = c(2, 2))
+
+  # Population distribution
+  hist(precincts$population, breaks = 50, main = "Distribution of Population",
+       xlab = "Population", ylab = "Number of Precincts", col = "lightgreen")
+
+  # Minority percentage distribution
+  hist(precincts$per_minority, breaks = 50, main = "Distribution of Minority %",
+       xlab = "Minority Percentage", ylab = "Number of Precincts", col = "lightblue")
+
+  # Population vs Minority % scatter
+  plot(precincts$population, precincts$per_minority,
+       main = "Population vs Minority %",
+       xlab = "Population", ylab = "Minority %",
+       pch = 16, col = rgb(0, 0, 1, 0.3))
+
+  # Cumulative distribution of minority %
+  plot(ecdf(precincts$per_minority),
+       main = "Cumulative Distribution of Minority %",
+       xlab = "Minority %", ylab = "Cumulative Probability")
+
+  par(mfrow = c(1, 1))
 
   return(precincts)
 }
 
-# Assign votes
-add_voting_behavior = function(precincts,
-                               prob_minority_dem = 0.81,
-                               prob_majority_dem = 0.37,
-                               sd_minority       = 0.1,
-                               sd_majority       = 0.3,
-                               voting_model      = "ei",
-                               rho               = 0.2, 
-                               b_min_context     = 0.1,
-                               b_maj_context     = 0.0,
-                               sigma_precinct    = 0.05,
-                               seed              = 123) {
+
+# Initial vote assignment BEFORE precincts assigned to geographic boundaries
+# Serves as baseline vote
+# Precinct-level group-speficic vote shares drawn from EI model
+add_baseline_votes = function(df, 
+                              prob_minority_dem = 0.81, 
+                              prob_majority_dem = 0.37,
+                              sd_minority       = 0.10, 
+                              sd_majority       = 0.30,
+                              rho               = 0.20,
+                              seed              = 123) {
   set.seed(seed)
-  n_precincts = nrow(precincts)
+  n_precincts = nrow(df)
   
-  # Validate voting model
-  if (!voting_model %in% c("ei", "contextual")) {
-    stop("voting_model must be either 'ei' or 'contextual'")
-  }
+  Sigma = matrix(
+    c(sd_minority^2, 
+      rho * sd_minority * sd_majority, 
+      rho * sd_minority * sd_majority,
+      sd_majority^2), 
+    2, 2
+  )
   
-  # Helper functions for logit transformation
-  logit = function(p) {
-    p = pmax(0.001, pmin(0.999, p))  # Avoid infinite values
-    log(p / (1 - p))
-  }
+  base = tmvtnorm::rtmvnorm(n     = n_precincts,
+                            mean  = c(prob_minority_dem, prob_majority_dem),
+                            sigma = Sigma, 
+                            lower = c(0, 0), upper = c(1, 1))
   
-  inv_logit = function(x) {
-    1 / (1 + exp(-x))
-  }
+  df$p_min_base = base[, 1]
+  df$p_maj_base = base[, 2]
   
-  # # Generate precinct-level random effects (IID)
-  # # These will shift both minority and majority voting probabilities in the same direction
-  # precinct_effects = rnorm(n_precincts, mean = 0, sd = sigma_precinct)
+  # Expand votes
+  df$dem_votes_minority     = rbinom(n_precincts, df$n_minority,  df$p_min_base)
+  df$dem_votes_majority     = rbinom(n_precincts, df$n_majority,  df$p_maj_base)
+  df$dem_votes              = df$dem_votes_minority + df$dem_votes_majority
+  df$rep_votes              = df$population - df$dem_votes
   
-  # replace IID with spatially correlated RE
-  precinct_effects = simulate_sar_field(spatial_precincts, rho = 0.7, sd = sigma_precinct)
+  df$rep_votes_minority     = df$n_minority - df$dem_votes_minority
+  df$rep_votes_majority     = df$n_majority - df$dem_votes_majority
   
-  # Set up covariance matrix for truncated multivariate normal
-  Sigma = matrix(c(
-    sd_minority^2,                       # Var(beta_b)
-    rho * sd_minority * sd_majority,     # Cov(beta_b, beta_w)
-    rho * sd_minority * sd_majority,     # Cov(beta_b, beta_w)
-    sd_majority^2                        # Var(beta_w)
-  ), nrow = 2)
+  df$dem_voteshare          = df$dem_votes / df$population
+  df$dem_voteshare_minority = ifelse(df$n_minority > 0, df$dem_votes_minority/df$n_minority, NA_real_)
+  df$dem_voteshare_majority = ifelse(df$n_majority > 0, df$dem_votes_majority/df$n_majority, NA_real_)
+
+  df
   
-  # Generate (beta_i^b, beta_i^w) from truncated bivariate normal
-  beta = rtmvnorm(n = n_precincts,
-                  mean = c(prob_minority_dem, prob_majority_dem),
-                  sigma = Sigma,
-                  upper = c(1, 1),
-                  lower = c(0, 0))
-  
-  # Extract base probabilities
-  prob_minority_vec = beta[, 1]
-  prob_majority_vec = beta[, 2]
-  
-  # Apply contextual effects if using contextual model
-  if (voting_model == 'contextual') {
-    # Add contextual effects on logit scale to maintain [0,1] bounds
-    logit_minority = logit(prob_minority_vec)
-    logit_majority = logit(prob_majority_vec)
-    
-    # Contextual effects: voting patterns influenced by precinct demographics
-    logit_minority = logit_minority + b_min_context * precincts$per_minority
-    logit_majority = logit_majority + b_maj_context * precincts$per_minority
-    
-    # Transform back to probability scale
-    prob_minority_vec = inv_logit(logit_minority)
-    prob_majority_vec = inv_logit(logit_majority)
-  }
-  
-  # Apply precinct-level random effects
-  # These shift both groups' probabilities in the same direction
-  # Applied on logit scale to maintain [0,1] bounds
-  logit_minority_final = logit(prob_minority_vec) + precinct_effects
-  logit_majority_final = logit(prob_majority_vec) + precinct_effects
-  
-  # Transform back to probability scale
-  prob_minority_vec_final = inv_logit(logit_minority_final)
-  prob_majority_vec_final = inv_logit(logit_majority_final)
-  
-  # Generate actual votes with individual-level noise (Bernoulli draws)
-  precincts$dem_votes_minority = rbinom(n_precincts, precincts$n_minority, prob_minority_vec_final)
-  precincts$dem_votes_majority = rbinom(n_precincts, precincts$n_majority, prob_majority_vec_final)
-  
-  # Calculate totals and vote shares
-  precincts$dem_votes = precincts$dem_votes_minority + precincts$dem_votes_majority
-  precincts$rep_votes = precincts$population - precincts$dem_votes
-  precincts$dem_voteshare = precincts$dem_votes / precincts$population
-  
-  # Store realized vote shares by group
-  precincts$dem_voteshare_minority = ifelse(precincts$n_minority > 0,
-                                            precincts$dem_votes_minority / precincts$n_minority, NA)
-  precincts$dem_voteshare_majority = ifelse(precincts$n_majority > 0,
-                                            precincts$dem_votes_majority / precincts$n_majority, NA)
-  
-  # Store the underlying probabilities (after all effects)
-  precincts$prob_minority_dem = prob_minority_vec_final
-  precincts$prob_majority_dem = prob_majority_vec_final
-  
-  # Store precinct effect for diagnostics
-  precincts$precinct_effect = precinct_effects
-  
-  # Add Republican vote counts by group
-  precincts$rep_votes_minority = precincts$n_minority - precincts$dem_votes_minority
-  precincts$rep_votes_majority = precincts$n_majority - precincts$dem_votes_majority
-  
-  # Report summary
-  cat("\nVoting assigned using", voting_model, "model:\n")
-  cat("Overall Dem vote share:", round(sum(precincts$dem_votes) / sum(precincts$population) * 100, 2), "%\n")
-  cat("Avg minority Dem support:", round(mean(precincts$dem_voteshare_minority, na.rm = TRUE) * 100, 2), "%\n")
-  cat("Avg majority Dem support:", round(mean(precincts$dem_voteshare_majority, na.rm = TRUE) * 100, 2), "%\n")
-  cat("Precinct effect SD (on logit scale):", round(sigma_precinct, 3), "\n")
-  
-  return(precincts)
 }
+                               
 
 apply_vote_model = function(spatial_precincts,
-                            voting_model      = "ei",
-                            prob_minority_dem = 0.81,
-                            prob_majority_dem = 0.37,
-                            sd_minority       = 0.10,
-                            sd_majority       = 0.30,
-                            rho               = 0.20,
-                            b_min_context     = 0.1,
-                            b_maj_context     = 0.0,
+                            voting_model       = "ei",
+                            prob_minority_dem  = 0.81,
+                            prob_majority_dem  = 0.37,
+                            sd_minority        = 0.10,
+                            sd_majority        = 0.30,
+                            rho                = 0.20,
+                            b_min_context      = 0.1,
+                            b_maj_context      = 0.0,
                             # spatial correlation pars
-                            sigma_precinct    = 0.12,   # SD of SAR precinct field on logit scale
-                            field_rho         = 0.75,   # SAR rho for precinct field
-                            shared_field_wt   = 0.35,   # weight of shared “partisan climate” field (logit scale)
-                            shared_field_rho  = 0.85,   # SAR rho for shared field
+                            sigma_precinct     = 0.12,   # SD of SAR precinct field on logit scale
+                            field_rho          = 0.75,   # SAR rho for precinct field
+                            shared_field_wt    = 0.35,   # weight of shared “partisan climate” field (logit scale)
+                            shared_field_rho   = 0.85,   # SAR rho for shared field
+                            use_base_probs     = TRUE,
+                            base_shrink_lambda = 1.0,
                             # reproducibility
-                            seed              = 123) {
+                            seed               = 123) {
   
   set.seed(seed)
   stopifnot(voting_model %in% c("ei","contextual"))
   n_precincts = nrow(spatial_precincts)
   
   # helper logits
-  logit    = function(p) { p = pmax(0.001, pmin(0.999, p)); log(p/(1-p)) }
-  inv_logit= function(x) 1/(1+exp(-x))
+  logit     = function(p) { p = pmax(0.001, pmin(0.999, p)); log(p/(1-p)) }
+  inv_logit = function(x) 1/(1+exp(-x))
   
-  # --- base group-level probabilities (truncated bivariate normal on [0,1]) ---
-  Sigma = matrix(c(
-    sd_minority^2,              rho * sd_minority * sd_majority,
-    rho * sd_minority * sd_majority, sd_majority^2
-  ), 2, 2)
+  have_base = use_base_probs && all(c("p_min_base","p_maj_base") %in% names(spatial_precincts))
   
-  base = tmvtnorm::rtmvnorm(
-    n       = n_precincts,
-    mean    = c(prob_minority_dem, prob_majority_dem),
-    sigma   = Sigma,
-    lower   = c(0, 0),
-    upper   = c(1, 1)
-  )
-  p_min = base[, 1]
-  p_maj = base[, 2]
+  if (have_base && base_shrink_lambda > 0) {
+    p_min = spatial_precincts$p_min_base
+    p_maj = spatial_precincts$p_maj_base
+    if (base_shrink_lambda < 1) {
+      Sigma = matrix(c(sd_minority^2, 
+                       rho * sd_minority * sd_majority,
+                       rho * sd_minority * sd_majority, 
+                       sd_majority^2), 2, 2)
+      draw = tmvtnorm::rtmvnorm(n_precincts, c(prob_minority_dem, prob_majority_dem),
+                                 Sigma, lower = c(0, 0), upper = c(1, 1))
+      
+      p_min = inv_logit((1 - base_shrink_lambda) * logit(draw[, 1]) + base_shrink_lambda * logit(p_min))
+      p_maj = inv_logit((1 - base_shrink_lambda) * logit(draw[, 2]) + base_shrink_lambda * logit(p_maj))
+    }
+  } else {
+    Sigma = matrix(c(sd_minority^2, 
+                     rho * sd_minority * sd_majority,
+                     rho * sd_minority * sd_majority, 
+                     sd_majority^2), 2, 2)
+    base  = tmvtnorm::rtmvnorm(n_precincts, 
+                               c(prob_minority_dem, prob_majority_dem),
+                               Sigma, lower = c(0, 0), upper = c(1, 1))
+    p_min = base[, 1] 
+    p_maj = base[, 2]
+  }
   
-  # --- spatially correlated precinct fields (SAR) ---
-  # realistic clustering
-  precinct_field = simulate_sar_field(spatial_precincts, rho = field_rho,  sd = sigma_precinct)
+  if (voting_model == "contextual") {
+    p_min = inv_logit(logit(p_min) + b_min_context*spatial_precincts$per_minority)
+    p_maj = inv_logit(logit(p_maj) + b_maj_context*spatial_precincts$per_minority)
+  }
+  
+  precinct_field = simulate_sar_field(spatial_precincts, rho = field_rho,     sd = sigma_precinct)
   shared_field   = simulate_sar_field(spatial_precincts, rho = shared_field_rho, sd = 1.0)
   
-  # combine on logit scale
-  lmin  = logit(p_min) + precinct_field + shared_field_wt * shared_field
-  lmaj  = logit(p_maj) + precinct_field + shared_field_wt * shared_field
-  p_min = inv_logit(lmin)
-  p_maj = inv_logit(lmaj)
+  p_min = inv_logit(logit(p_min) + precinct_field + shared_field_wt*shared_field)
+  p_maj = inv_logit(logit(p_maj) + precinct_field + shared_field_wt*shared_field)
   
   # --- generate votes (fixed population) ---
   
@@ -539,7 +493,7 @@ apply_vote_model = function(spatial_precincts,
   spatial_precincts$dem_voteshare          = spatial_precincts$dem_votes / spatial_precincts$population
   spatial_precincts$dem_voteshare_minority = ifelse(spatial_precincts$n_minority > 0,
                                                     spatial_precincts$dem_votes_minority/spatial_precincts$n_minority, NA_real_)
-  spatial_precincts$dem_voteshare_majority = ifelse(spatial_precincts$n_majority>0,
+  spatial_precincts$dem_voteshare_majority = ifelse(spatial_precincts$n_majority > 0,
                                                     spatial_precincts$dem_votes_majority/spatial_precincts$n_majority, NA_real_)
   
   spatial_precincts$prob_minority_dem = p_min
@@ -558,214 +512,74 @@ apply_vote_model = function(spatial_precincts,
 
 
 
-# place_voters_on_map = function(precinct_data,
-#                                grid_result,
-#                                segregation_level = "medium",
-#                                seed = 123) {
-#   
-#   set.seed(seed)
-#   
-#   grid = grid_result$precincts
-#   n_precincts = nrow(precinct_data)
-#   
-#   cat("\nAssigning fixed population with", segregation_level, "segregation...\n")
-#   
-#   # --- Generate assignment scores ---
-#   
-#   if (segregation_level == "low") {
-#     # Pure random assignment for low segregation
-#     assignment_order = sample(1:n_precincts)
-#     
-#   } else {
-#     # Medium and High
-#     
-#     # Normalize minority share 
-#     precinct_data$per_minority_std = (precinct_data$per_minority - min(precinct_data$per_minority)) / (max(precinct_data$per_minority) - min(precinct_data$per_minority))
-# 
-#     rank_socio = rank(-precinct_data$per_minority_std, ties.method = 'random')
-#     rank_random = rank(runif(n_precincts), ties.method = "random")
-#     
-#     alpha = switch(segregation_level, 'medium' = 0.5, 'high' = 1.0)
-#     final_rank = alpha * rank_socio + (1- alpha) * rank_random
-#     assignment_order = order(final_rank)
-#     
-#   }
-#   
-#   # --- Assignment ---
-#   
-#   # --- Build a blended spatial score on polygons ---
-#   # stronger rho ⇒ smoother, bigger patches
-#   rho_by_level   = c(low = 0.25, medium = 0.55, high = 0.85)
-#   gamma_by_level = c(low = 0.20, medium = 0.45, high = 0.75)  # weight on urbanness
-#   delta_by_level = c(low = 0.80, medium = 0.40, high = 0.20)  # small white-noise
-#   
-#   rho   = rho_by_level[[segregation_level]]
-#   gamma = gamma_by_level[[segregation_level]]
-#   delta = delta_by_level[[segregation_level]]
-#   
-#   Z   = simulate_sar_field(grid, rho = rho, sd = 1)
-#   U   = scale(grid$urbanness)
-#   eps = rnorm(nrow(grid), 0, 1)
-#   
-#   score = as.numeric(scale(gamma * U + (1 - gamma) * Z + delta * eps))
-#   
-#   # --- Rank-match the *entire rows* (so totals stay identical) ---
-#   assign_idx = rank_match_assign(precinct_data$per_minority, score)
-#   
-#   spatial_precincts = grid
-#   spatial_precincts[, names(precinct_data)] = precinct_data[assign_idx, ]
-#   
-#   # (OLD)
-#   # # Sort precinct boundaries by decreasing urbanness
-#   # grid_sorted = grid[order(grid$urbanness, decreasing = TRUE), ]
-#   # 
-#   # # Arrange precinct data
-#   # precinct_data_sorted = precinct_data[assignment_order, ]
-#   # 
-#   # # Combine
-#   # spatial_precincts = grid_sorted
-#   # spatial_precincts[, names(precinct_data)] = precinct_data_sorted
-#   
-#   
-#   # --- Calculate spatial correlation ---
-#   
-#   if (inherits(spatial_precincts, "sf") && nrow(spatial_precincts) > 1) {
-#     # Suppress warnings about no neighbours, which can happen in small test grids
-#     nb = suppressWarnings(poly2nb(spatial_precincts, queen = TRUE))
-#     W = nb2listw(nb, style = "W", zero.policy = TRUE)
-#     
-#     # Calculate Moran's I for the two key variables
-#     morans_minority = moran.test(spatial_precincts$per_minority, W, zero.policy = TRUE, alternative = "greater")
-#     # morans_dem = moran.test(spatial_precincts$dem_voteshare, W, zero.policy = TRUE, alternative = "greater")
-#     
-#     cat("Moran's I (Minority %):", round(morans_minority$estimate[[1]], 4), "\n")
-#     # cat("Moran's I (Dem Voshare):", round(morans_dem$estimate[[1]], 4), "\n")
-#   }
-#   
-#   # Return the final sf object with data assigned
-#   return(spatial_precincts)
-#   
-# }
+place_voters_on_map = function(precinct_data,
+                               grid_result,
+                               segregation_level = "medium",
+                               voting_weight = 0.4,
+                               seed = 123) {
 
-place_voters_on_map <- function(precinct_data,
-                                grid_result,
-                                segregation_level = "medium",
-                                seed = 123,
-                                center_weight = c("urbanness_sum", "intensity", "hybrid"),
-                                hybrid_lambda = 0.7) {
-  
   set.seed(seed)
-  center_weight <- match.arg(center_weight)
-  
-  grid    <- grid_result$precincts
-  centers <- grid_result$centers
-  stopifnot(inherits(grid, "sf"))
-  
-  # ----- Make sure every row has a cluster and a stable row index -----
-  grid$row_idx <- seq_len(nrow(grid))
-  
-  if (!"nearest_center" %in% names(grid) || any(is.na(grid$nearest_center))) {
-    ctr_sf <- sf::st_as_sf(centers, coords = c("x","y"), crs = sf::st_crs(grid))
-    centroids <- sf::st_centroid(grid$geometry)
-    nn <- sf::st_nearest_feature(centroids, ctr_sf)
-    if (!"nearest_center" %in% names(grid)) {
-      grid$nearest_center <- nn
-    } else {
-      grid$nearest_center[is.na(grid$nearest_center)] <- nn[is.na(grid$nearest_center)]
-    }
+
+  grid = grid_result$precincts
+  n_precincts = nrow(precinct_data)
+
+  cat("\nAssigning fixed population with", segregation_level, "segregation...\n")
+
+  # --- Generate assignment scores ---
+
+  if (segregation_level == "low") {
+    # Pure random assignment for low segregation
+    assignment_order = sample(1:n_precincts)
+
+  } else {
+    # Medium and High
+
+    # Normalize minority share and dem voteshare
+    precinct_data$per_minority_std = (precinct_data$per_minority - min(precinct_data$per_minority)) / (max(precinct_data$per_minority) - min(precinct_data$per_minority))
+    precinct_data$dem_voteshare_std = (precinct_data$dem_voteshare - min(precinct_data$dem_voteshare)) / (max(precinct_data$dem_voteshare) - min(precinct_data$dem_voteshare))
+    
+    # combined score
+    precinct_data$assignment_score = voting_weight * precinct_data$dem_voteshare_std + (1 - voting_weight) * precinct_data$per_minority_std
+    
+    rank_socio = rank(-precinct_data$assignment_score, ties.method = 'random')
+    rank_random = rank(runif(n_precincts), ties.method = "random")
+
+    alpha = switch(segregation_level, 'medium' = 0.5, 'high' = 1.0)
+    final_rank = alpha * rank_socio + (1- alpha) * rank_random
+    assignment_order = order(final_rank)
+
   }
-  
-  # ----- Cluster polygons by center and order by urbanness (core→edge) -----
-  grid <- grid %>%
-    dplyr::group_by(nearest_center) %>%
-    dplyr::arrange(dplyr::desc(.data$urbanness), .by_group = TRUE) %>%
-    dplyr::mutate(center_row = dplyr::row_number()) %>%
-    dplyr::ungroup()
-  
-  buckets <- split(grid, grid$nearest_center)
-  C <- length(buckets)
-  
-  # ----- Weights for how much of the *top* rows each center should get -----
-  center_stats <- grid %>%
-    dplyr::group_by(nearest_center) %>%
-    dplyr::summarise(
-      slots   = dplyr::n(),
-      urb_sum = sum(.data$urbanness, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::arrange(nearest_center)
-  
-  intens <- centers$intensity[match(center_stats$nearest_center, centers$id)]
-  
-  w <- switch(center_weight,
-              "urbanness_sum" = center_stats$urb_sum,
-              "intensity"     = ifelse(is.na(intens), 1, intens),
-              "hybrid"        = {
-                base <- 0.0001 + hybrid_lambda * center_stats$urb_sum +
-                  (1 - hybrid_lambda) * ifelse(is.na(intens), 1, intens)
-                scales::rescale(base, to = c(0.0001, 1))
-              }
-  )
-  w <- w / sum(w)
-  
-  # ----- Build the segregation ranking for the *rows* we’ll place -----
-  pd <- precinct_data
-  pd$per_minority_std <- (pd$per_minority - min(pd$per_minority)) /
-    (max(pd$per_minority) - min(pd$per_minority) + 1e-9)
-  
-  rank_socio  <- rank(-pd$per_minority_std, ties.method = "random")
-  rank_random <- rank(runif(nrow(pd)),         ties.method = "random")
-  
-  alpha <- switch(segregation_level, "low" = 0, "medium" = 0.5, "high" = 1.0)
-  final_rank <- alpha * rank_socio + (1 - alpha) * rank_random
-  pd_sorted  <- pd[order(final_rank), , drop = FALSE]
-  
-  # ----- Weighted round-robin to decide which cluster each row goes to -----
-  cap     <- center_stats$slots
-  deficit <- rep(0, C)
-  filled  <- rep(0, C)
-  queues  <- replicate(C, integer(0), simplify = FALSE) # indices into pd_sorted
-  
-  for (k in seq_len(nrow(pd_sorted))) {
-    elig <- which(filled < cap)
-    if (length(elig) == 0) break
-    deficit[elig] <- deficit[elig] + w[elig]
-    c_sel <- elig[which.max(deficit[elig])]
-    queues[[c_sel]] <- c(queues[[c_sel]], k)
-    filled[c_sel]   <- filled[c_sel] + 1
-    deficit[c_sel]  <- deficit[c_sel] - 1
-  }
-  
-  # Sanity: each queue must match cluster size
-  stopifnot(all(vapply(queues, length, 1L) == cap))
-  
-  # ----- Write rows into polygons by *row index*, not precinct_id -----
-  assigned <- grid
-  cols_to_copy <- setdiff(names(precinct_data), "per_minority_std")
-  
-  for (j in seq_len(C)) {
-    center_id <- center_stats$nearest_center[j]
-    cluster   <- buckets[[as.character(center_id)]]
-    write_rows <- which(assigned$nearest_center == center_id)            # contiguous and ordered by urbanness
-    k_list    <- queues[[j]]                 # which rows from pd_sorted to use
-    assigned[write_rows, cols_to_copy] <- pd_sorted[k_list, cols_to_copy, drop = FALSE]
-  }
-  
-  spatial_precincts <- assigned
-  
-  # ----- Diagnostics: preserve totals & spatial autocorr -----
-  if (abs(sum(spatial_precincts$population) - sum(precinct_data$population)) > 0)
-    warning("Population total changed — it should not. Check inputs.")
-  
+
+  # --- Assignment ---
+
+  # Sort precinct boundaries by decreasing urbanness
+  grid_sorted = grid[order(grid$urbanness, decreasing = TRUE), ]
+
+  # Arrange precinct data
+  precinct_data_sorted = precinct_data[assignment_order, ]
+
+  # Combine
+  spatial_precincts = grid_sorted
+  spatial_precincts[, names(precinct_data)] = precinct_data_sorted
+
+  # --- Calculate spatial correlation ---
+
   if (inherits(spatial_precincts, "sf") && nrow(spatial_precincts) > 1) {
-    nb <- suppressWarnings(spdep::poly2nb(spatial_precincts, queen = TRUE))
-    W  <- spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
-    mi_min <- spdep::moran.test(spatial_precincts$per_minority, W,
-                                zero.policy = TRUE, alternative = "greater")
-    cat("Moran's I (Minority %):", round(mi_min$estimate[[1]], 4), "\n")
+    # Suppress warnings about no neighbours, which can happen in small test grids
+    nb = suppressWarnings(poly2nb(spatial_precincts, queen = TRUE))
+    W = nb2listw(nb, style = "W", zero.policy = TRUE)
+
+    # Calculate Moran's I for the two key variables
+    morans_minority = moran.test(spatial_precincts$per_minority, W, zero.policy = TRUE, alternative = "greater")
+    morans_dem = moran.test(spatial_precincts$dem_voteshare, W, zero.policy = TRUE, alternative = "greater")
+
+    cat("Moran's I (Minority %):", round(morans_minority$estimate[[1]], 4), "\n")
+    cat("Moran's I (Dem Voshare):", round(morans_dem$estimate[[1]], 4), "\n")
   }
-  
-  spatial_precincts
+
+  # Return the final sf object with data assigned
+  return(spatial_precincts)
+
 }
 
 
@@ -1231,7 +1045,14 @@ save_simulation_parameters = function(simulation_results,
                                       n_districts,
                                       n_plans,
                                       pop_deviation,
-                                      ensemble_size) {
+                                      ensemble_size,
+                                      dev_mode,
+                                      burst_length,
+                                      num_bursts,    
+                                      patience_bursts,
+                                      soft_k,
+                                      simplify_tolerance,
+                                      score_models) {
   
   params_text = paste0(
     "SIMULATION PARAMETERS\n",
@@ -1284,8 +1105,17 @@ save_simulation_parameters = function(simulation_results,
     sprintf("%-25s = %d\n", "n_districts", n_districts),
     sprintf("%-25s = %d\n", "n_plans", n_plans),
     sprintf("%-25s = %d\n", "ensemble_size", ensemble_size),
-    # NEW
-    sprintf("%-25s = %.2f\n", "pop_deviation", pop_deviation)
+    sprintf("%-25s = %.2f\n", "pop_deviation", pop_deviation),
+    
+    "Dev Mode Parameters:\n",
+    sprintf("%-25s = %s\n", "dev_mode", ifelse(dev_mode, "Enabled", "Disabled")),
+    sprintf("%-25s = %d\n", "burst_length", burst_length),
+    sprintf("%-25s = %d\n", "num_bursts", num_bursts),
+    sprintf("%-25s = %d\n", "patience_bursts", patience_bursts),
+    sprintf("%-25s = %d\n", "soft_k", soft_k),
+    sprintf("%-25s = %s\n", "simplify_tolerance", 
+            ifelse(is.na(simplify_tolerance), "None", as.character(simplify_tolerance))),
+    sprintf("%-25s = %s\n", "score_models", ifelse(score_models, "Enabled", "Disabled"))
   )
   
   # Add summary statistics (unchanged)
@@ -1722,20 +1552,20 @@ plot_precincts_with_districts = function(map_data, CD_plans, map_ids, category_n
   # Calculate district-level statistics for the seat winner plot
   cd_summary = map_data %>% 
     st_drop_geometry() %>%
-    mutate(
-      dem_vote_count = dem_voteshare * population,
-      minority_voter_count = per_minority * population,
-      majority_voter_count = population - minority_voter_count
-    ) %>% 
+    # mutate(
+    #   dem_vote_count = dem_voteshare * population,
+    #   minority_voter_count = per_minority * population,
+    #   majority_voter_count = population - minority_voter_count
+    # ) %>% 
     group_by(district_id) %>%
     summarise(
       n_precincts = n(),
-      n_voters = sum(population),
-      n_minority_voters = sum(minority_voter_count),
-      n_majority_voters = sum(majority_voter_count),
-      per_minority = n_minority_voters / n_voters,
-      dem_votes = sum(dem_vote_count),
-      dem_voteshare = dem_votes / n_voters, 
+      population = sum(population),
+      n_minority = sum(n_minority),
+      n_majority = sum(n_majority),
+      per_minority = n_minority / population,
+      dem_votes = sum(dem_votes),
+      dem_voteshare = dem_votes / population, 
       dem_cd = ifelse(dem_voteshare > 0.5, 1, 0)
     )
   
@@ -2200,6 +2030,148 @@ create_ensemble_visualizations = function(summaries, output_dir, segregation_lev
   }
 }
 
+# 5. GALLERY OF DISTRICTING PLANS
+
+# Winners-by-district small map (precincts outlined) ----
+plot_winner_small = function(map_sf, assignment_vec) {
+  # map_sf must have: precinct_id, dem_votes, rep_votes, population, geometry
+  # assignment_vec is integer vector of district ids aligned to map_sf$precinct_id
+  
+  # Align and attach district ids
+  stopifnot("precinct_id" %in% names(map_sf))
+  stopifnot(length(assignment_vec) == nrow(map_sf))
+  map_sf$district_id = as.integer(assignment_vec)
+  
+  # Make sure we have vote COUNT columns
+  vn = names(map_sf)
+  if (!("dem_votes" %in% vn) && ("dem_v" %in% vn)) {
+    map_sf = dplyr::rename(map_sf, dem_votes = dem_v)
+  }
+  if (!("rep_votes" %in% vn) && ("rep_v" %in% vn)) {
+    map_sf = dplyr::rename(map_sf, rep_votes = rep_v)
+  }
+  if (!("population" %in% vn) && ("pop" %in% vn)) {
+    map_sf = dplyr::rename(map_sf, population = pop)
+  }
+  
+  # District winners
+  cd_summary = map_sf |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(district_id) |>
+    dplyr::summarise(
+      dem_votes = sum(dem_votes, na.rm = TRUE),
+      rep_votes = sum(rep_votes, na.rm = TRUE),
+      population = sum(as.numeric(population), na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(party = ifelse(dem_votes >= rep_votes, "Democrat", "Republican"))
+  
+  # District polygons
+  cd_polys = map_sf |>
+    dplyr::group_by(district_id) |>
+    dplyr::summarise(geometry = sf::st_union(geometry), .groups = "drop") |>
+    dplyr::left_join(cd_summary, by = "district_id")
+  
+  # Seat counts (for a tiny caption)
+  dem_seats = sum(cd_summary$party == "Democrat")
+  rep_seats = sum(cd_summary$party == "Republican")
+  
+  ggplot() +
+    geom_sf(data = cd_polys, aes(fill = party), color = NA) +                  # districts shaded by winner
+    geom_sf(data = map_sf, fill = NA, color = "#2b2b2b", linewidth = 0.05) +  # precinct outlines
+    scale_fill_manual(values = c("Democrat" = "#1f77b4", "Republican" = "#d62728")) +
+    guides(fill = "none") +
+    theme_void() +
+    theme(plot.margin = margin(1, 1, 1, 1, "pt"))
+}
+
+#  Build a 5×3 gallery page for one segregation level ----
+build_party_grid_page = function(level_dir, title = "Segregation Level") {
+  # Load the shapefile written earlier
+  shp = file.path(level_dir, "state_map.shp")
+  stopifnot(file.exists(shp))
+  map_sf = sf::st_read(shp, quiet = TRUE)
+  # Standardize column names used downstream
+  map_sf = dplyr::rename(
+    map_sf,
+    precinct_id = dplyr::coalesce("precinct_id", "pct_id"),
+    population  = dplyr::coalesce("population",  "pop")
+  )
+  
+  # Helper to read a plan csv safely
+  read_plans = function(path) if (file.exists(path)) data.table::fread(path) else NULL
+  
+  # Plan matrices
+  dem_df  = read_plans(file.path(level_dir, "democratic", "CD_plans.csv"))
+  rep_df  = read_plans(file.path(level_dir, "republican", "CD_plans.csv"))
+  neu_df  = read_plans(file.path(level_dir, "neutral",   "CD_plans.csv"))
+  
+  # Column pickers (5 random plans; sample with replacement if fewer exist)
+  pick_cols = function(df) {
+    if (is.null(df)) return(character(0))
+    base_drop = intersect(c("precinct_id","init_CD"), names(df))
+    plan_cols = setdiff(names(df), base_drop)
+    if (!length(plan_cols)) return(character(0))
+    sample(plan_cols, size = min(5, length(plan_cols)), replace = length(plan_cols) < 5)
+  }
+  
+  dem_cols = pick_cols(dem_df)
+  neu_cols = pick_cols(neu_df)
+  rep_cols = pick_cols(rep_df)
+  
+  # Return placeholders if missing
+  make_empty = function() {
+    ggplot() + theme_void() + geom_text(aes(0,0,label="No plans"), inherit.aes = FALSE)
+  }
+  
+  # One small plot builder for a specific column in a df
+  make_small = function(df, colname) {
+    if (is.null(df) || !length(colname)) return(make_empty())
+    ord = match(map_sf$precinct_id, df$precinct_id)
+    stopifnot(!any(is.na(ord)))
+    assignment = as.integer(df[[colname]][ord])
+    plot_winner_small(map_sf, assignment)
+  }
+  
+  # Top row: DEM (5)
+  row_dem = lapply(dem_cols, function(cn) make_small(dem_df, cn))
+  while (length(row_dem) < 5) row_dem[[length(row_dem)+1]] = make_empty()
+  
+  # Middle row: NEUTRAL (5)
+  row_neu = lapply(neu_cols, function(cn) make_small(neu_df, cn))
+  while (length(row_neu) < 5) row_neu[[length(row_neu)+1]] = make_empty()
+  
+  # Bottom row: REP (5)
+  row_rep = lapply(rep_cols, function(cn) make_small(rep_df, cn))
+  while (length(row_rep) < 5) row_rep[[length(row_rep)+1]] = make_empty()
+  
+  # Assemble 3×5
+  page = (wrap_plots(row_dem, ncol = 5) /
+            wrap_plots(row_neu, ncol = 5) /
+            wrap_plots(row_rep, ncol = 5)) +
+    plot_annotation(
+      title = title,
+      subtitle = "Top row: Democratic gerrymanders   ·   Middle: Neutral   ·   Bottom: Republican gerrymanders"
+    )
+  page
+}
+
+# Export a single 3-page PDF (low/medium/high) ----
+export_plan_gallery_3pages = function(main_output_dir, file_name = "plan_gallery_by_seg_level_plan_type.pdf") {
+  levels = c("low","medium","high")
+  pages  = list(
+    build_party_grid_page(file.path(main_output_dir, "low"),    "LOW segregation"),
+    build_party_grid_page(file.path(main_output_dir, "medium"), "MEDIUM segregation"),
+    build_party_grid_page(file.path(main_output_dir, "high"),   "HIGH segregation")
+  )
+  out = file.path(main_output_dir, file_name)
+  grDevices::pdf(out, width = 18, height = 10, onefile = TRUE)
+  for (p in pages) print(p)
+  grDevices::dev.off()
+  message("Wrote 3-page gallery: ", out)
+}
+
+
 
 # ===================================================================
 # =============== PART 5: MAIN ANALYSIS FUNCTIONS ===================
@@ -2262,6 +2234,13 @@ simulate_segregation_scenarios = function(n_precincts       = 2600,
   #   seed = seed + 1
   # )
   
+  # Step 2: Assign voting preferences
+  fixed_population = add_baseline_votes(
+    fixed_population,
+    prob_minority_dem, prob_majority_dem, sd_minority, sd_majority, rho,
+    seed = seed + 1
+  )
+  
   # Step 3: Create spatial grid with better urban structure
   cat("\n=== CREATING SPATIAL GRID ===\n")
   grid_result = create_realistic_grid(
@@ -2292,20 +2271,22 @@ simulate_segregation_scenarios = function(n_precincts       = 2600,
     
     # (NEW) assign votes *after* placement using spatial fields
     spatial_precincts = apply_vote_model(
-      spatial_precincts = spatial_precincts,
-      voting_model      = voting_model,
-      prob_minority_dem = prob_minority_dem,
-      prob_majority_dem = prob_majority_dem,
-      sd_minority       = sd_minority,
-      sd_majority       = sd_majority,
-      rho               = rho,
-      b_min_context     = b_min_context,
-      b_maj_context     = b_maj_context,
-      sigma_precinct    = sigma_precinct,
-      field_rho         = field_rho,   
-      shared_field_wt   = shared_field_wt,   
-      shared_field_rho  = shared_field_rho,
-      seed              = seed + 10  # any deterministic offset
+      spatial_precincts  = spatial_precincts,
+      voting_model       = voting_model,
+      prob_minority_dem  = prob_minority_dem,
+      prob_majority_dem  = prob_majority_dem,
+      sd_minority        = sd_minority,
+      sd_majority        = sd_majority,
+      rho                = rho,
+      b_min_context      = b_min_context,
+      b_maj_context      = b_maj_context,
+      sigma_precinct     = sigma_precinct,
+      field_rho          = field_rho,   
+      shared_field_wt    = shared_field_wt,   
+      shared_field_rho   = shared_field_rho,
+      use_base_probs     = TRUE, 
+      base_shrink_lambda = 1.0,            # 0.6–0.8 for extra randomness
+      seed               = seed + 10       # keep same across levels to isolate placement
     )
     
     results[[level]] = list(precincts = spatial_precincts, centers = grid_result$centers)
@@ -2396,7 +2377,7 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     sd_minority       = sd_minority,
     sd_majority       = sd_majority,
     rho               = rho,
-    b_min_context     = b_min_context,   # fixed (no n_min_context typo)
+    b_min_context     = b_min_context,   
     b_maj_context     = b_maj_context,
     sigma_precinct    = sigma_precinct,
     field_rho         = field_rho,   
@@ -2469,7 +2450,14 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     n_districts,
     n_plans,
     pop_deviation,
-    ensemble_size
+    ensemble_size,
+    dev_mode,
+    burst_length,
+    num_bursts,    
+    patience_bursts,
+    soft_k,
+    simplify_tolerance,
+    score_models
   )
   
   # Define segregation levels
@@ -2538,9 +2526,9 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     # Run all three types of redistricting
     cat("\nRunning redistricting analyses...\n")
     
-    redistricting_results <- list()
-    model_summaries <- NULL   # predefine to avoid scope issues
-    summaries <- NULL         # what downstream plots will use
+    redistricting_results = list()
+    model_summaries = NULL   # predefine to avoid scope issues
+    summaries = NULL         # what downstream plots will use
     
     tryCatch({
       redistricting_results = run_redistricting(
@@ -2601,9 +2589,9 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
         if (!is.null(summaries) && length(summaries) > 0) {
           create_ensemble_visualizations(summaries, current_output_dir, current_level)
           
-          CD_plans_neutral <- NULL
-          neutral_plans_file <- file.path(current_output_dir, "neutral/CD_plans.csv")
-          if (file.exists(neutral_plans_file)) CD_plans_neutral <- data.table::fread(neutral_plans_file)
+          CD_plans_neutral = NULL
+          neutral_plans_file = file.path(current_output_dir, "neutral/CD_plans.csv")
+          if (file.exists(neutral_plans_file)) CD_plans_neutral = data.table::fread(neutral_plans_file)
           
           create_redistricting_visualizations(
             map_data              = precincts_E0,
@@ -2624,9 +2612,9 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
         
         if (!is.null(summaries)) {
           # Neutral plans for overlays if present
-          CD_plans_neutral <- NULL
-          neutral_plans_file <- file.path(current_output_dir, "neutral/CD_plans.csv")
-          if (file.exists(neutral_plans_file)) CD_plans_neutral <- data.table::fread(neutral_plans_file)
+          CD_plans_neutral = NULL
+          neutral_plans_file = file.path(current_output_dir, "neutral/CD_plans.csv")
+          if (file.exists(neutral_plans_file)) CD_plans_neutral = data.table::fread(neutral_plans_file)
           
           create_redistricting_visualizations(
             map_data              = precincts_E0,
@@ -2643,9 +2631,9 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     })
     
     # Store results safely
-    all_results[[current_level]]$summaries <- summaries
+    all_results[[current_level]]$summaries = summaries
     if (!is.null(model_summaries)) {
-      all_results[[current_level]]$model_summaries <- model_summaries
+      all_results[[current_level]]$model_summaries = model_summaries
     }
   }
   
@@ -2664,6 +2652,9 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
   
   # Save all results
   saveRDS(all_results, paste0(main_output_dir, "all_results.rds"))
+  
+  # Gallery of plans
+  export_plan_gallery_3pages(main_output_dir)
   
   cat("\n=== ANALYSIS COMPLETE ===\n")
   cat("Results saved to:", main_output_dir, "\n")

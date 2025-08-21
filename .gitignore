@@ -6,6 +6,7 @@ Scripts/
 Simulated Shapefiles/
 Simulating Plans/
 Workflow/
+Bluehive/
 
 # Files to ignore
 sim_population_tc.R
