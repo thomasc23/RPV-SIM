@@ -12,6 +12,7 @@ sim_population_tc.R
 wasted_votes_analysis_may30.R
 02_run_er_ei.R
 03_prepare_results.R
+03b_prepare_precinct_results.R
 04_make_tables.R
 05_make_figures.R
 05b_make_precinct_figures.R
