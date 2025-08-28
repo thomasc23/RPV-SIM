@@ -1,3 +1,17 @@
+# R specific
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+.Ruserdata
+
+# Python specific
+__pychache__/
+.ipynb_checkpoints/
+
+# OS specific
+.DS_Store
+
 # Directories to ignore
 ARCHIVE/
 Neutral Redistricting/
