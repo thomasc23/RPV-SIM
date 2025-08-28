@@ -1,4 +1,15 @@
-source('R/setup_python_env.R')
+# source('R/setup_python_env.R')
+
+# Ensure reticulate is available and pointed at the job's Python
+if (!requireNamespace("reticulate", quietly = TRUE)) {
+  stop("The 'reticulate' package is required but not installed.")
+}
+library(reticulate)
+
+# Respect the Slurm-exported Python
+use_python(Sys.getenv("RETICULATE_PYTHON"), required = TRUE)
+
+
 
 # ===================================================================
 # ==================== PART 1: GRID GENERATION ======================
@@ -111,7 +122,7 @@ create_precinct_boundaries = function(seed_points, bounds = c(0, 1000, 0, 1000))
   )
   precincts = st_make_valid(precincts)
   precincts = st_buffer(precincts, 0)
-  precincts = st_snap_to_grid(precincts, size = 0.001)
+  #  precincts = st_snap_to_grid(precincts, size = 0.001)
   
   # Create spatial points and find which precinct each seed falls in
   seed_sf = st_as_sf(
@@ -366,8 +377,8 @@ create_population_data = function(n_precincts    = 2600,
   return(precincts)
 }
 
-
-# Baseline vote assignment BEFORE precincts assigned to geographic boundaries
+# Initial vote assignment BEFORE precincts assigned to geographic boundaries
+# Serves as baseline vote
 # Precinct-level group-speficic vote shares drawn from EI model
 add_baseline_votes = function(df, 
                               prob_minority_dem = 0.81, 
@@ -509,6 +520,7 @@ apply_vote_model = function(spatial_precincts,
   
   spatial_precincts
 }
+
 
 
 place_voters_on_map = function(precinct_data,
@@ -735,7 +747,7 @@ process_redistricting_results = function(map_data, redistricting_results, curren
         output_dir = paste0(current_output_dir, "neutral/")
       )
       
-      cat("Processed", ncol(CD_plans_neutral) - 2, "neutral plans\n\n")
+      cat("Processed", ncol(CD_plans_neutral) - 2, "neutral plans\n")
     }
   }
   
@@ -783,7 +795,7 @@ save_plan_summaries = function(map_data, plan_data, plan_type, output_dir) {
   plan_columns = setdiff(names(plan_data), c("precinct_id", "init_CD"))  # plan columns only
   n_plans = length(plan_columns)
   
-  cat("\nProcessing", n_plans, plan_type, if (plan_type=="neutral") "plans" else "ensemble plans", "\n")
+  cat("Processing", n_plans, plan_type, if (plan_type=="neutral") "plans" else "ensemble plans", "\n")
   
   for (i in seq_len(n_plans)) {
     if (i %% ifelse(plan_type=="neutral", 100, 5) == 0)
@@ -1208,12 +1220,14 @@ run_redistricting = function(shapefile_path,
                              num_bursts           = 20,
                              patience_bursts      = 8,
                              soft_k               = 60,
-                             simplify_tolerance   = NA) {
+                             simplify_tolerance   = NA,
+                             save_every_steps     = 25,
+                             resume               = TRUE) {
   
   python_script = "Python/run_recom_short_bursts.py"
   
   message("Loading Python script:", python_script)
-  py_run_file(python_script)
+  reticulate::py_run_file(python_script)
   
   # Create clean directory structure
   subdirs = c("neutral", "republican", "democratic")
@@ -1226,48 +1240,52 @@ run_redistricting = function(shapefile_path,
   
   # 1. Neutral redistricting
   message("\nRunning neutral redistricting analysis...")
-  results$neutral = py$run_redistricting_analysis(
-    shapefile_path = shapefile_path,
-    output_dir = paste0(output_dir, "neutral/"),
-    num_steps = as.integer(num_steps),
-    pop_deviation = as.numeric(pop_deviation),
-    num_districts = as.integer(num_districts)
+  results$neutral    = reticulate::py$run_redistricting_analysis(
+    shapefile_path   = shapefile_path,
+    output_dir       = paste0(output_dir, "neutral/"),
+    num_steps        = as.integer(num_steps),
+    pop_deviation    = as.numeric(pop_deviation),
+    num_districts    = as.integer(num_districts),
+    save_every_steps = save_every_steps,
+    resume           = resume
   )
   
   # 2. Republican gerrymander ensemble
   message("\nRunning Republican gerrymandering ensemble...")
-  results$republican = py$create_biased_ensemble(
-    shapefile_path = shapefile_path,
-    output_dir = paste0(output_dir, "republican/"),
-    ensemble_size = as.integer(ensemble_size),
-    bias_type = "republican",
-    pop_deviation = as.numeric(pop_deviation),
-    num_districts = as.integer(num_districts),
+  results$republican = reticulate::py$create_biased_ensemble(
+    shapefile_path     = shapefile_path,
+    output_dir         = paste0(output_dir, "republican/"),
+    ensemble_size      = as.integer(ensemble_size),
+    bias_type          = "republican",
+    pop_deviation      = as.numeric(pop_deviation),
+    num_districts      = as.integer(num_districts),
     # Dev mode parameters
     dev_mode           = dev_mode,
     burst_length       = as.integer(burst_length),
     num_bursts         = as.integer(num_bursts),
     patience_bursts    = as.integer(patience_bursts),
     soft_k             = as.numeric(soft_k),
-    simplify_tolerance = if (is.na(simplify_tolerance)) NULL else as.numeric(simplify_tolerance)
+    simplify_tolerance = if (is.na(simplify_tolerance)) NULL else as.numeric(simplify_tolerance),
+    resume             = resume
   )
   
   # 3. Democratic gerrymander ensemble
   message("\nRunning Democratic gerrymandering ensemble...")
-  results$democratic = py$create_biased_ensemble(
-    shapefile_path = shapefile_path,
-    output_dir = paste0(output_dir, "democratic/"),
-    ensemble_size = as.integer(ensemble_size),
-    bias_type = "democratic",
-    pop_deviation = as.numeric(pop_deviation),
-    num_districts = as.integer(num_districts),
+  results$democratic = reticulate::py$create_biased_ensemble(
+    shapefile_path     = shapefile_path,
+    output_dir         = paste0(output_dir, "democratic/"),
+    ensemble_size      = as.integer(ensemble_size),
+    bias_type          = "democratic",
+    pop_deviation      = as.numeric(pop_deviation),
+    num_districts      = as.integer(num_districts),
     # Dev mode parameters
     dev_mode           = dev_mode,
     burst_length       = as.integer(burst_length),
     num_bursts         = as.integer(num_bursts),
     patience_bursts    = as.integer(patience_bursts),
     soft_k             = as.numeric(soft_k),
-    simplify_tolerance = if (is.na(simplify_tolerance)) NULL else as.numeric(simplify_tolerance)
+    simplify_tolerance = if (is.na(simplify_tolerance)) NULL else as.numeric(simplify_tolerance),
+    resume             = resume
   )
   
   return(results)
@@ -1645,9 +1663,9 @@ plot_ensemble_seat_distribution = function(scores, party_type, segregation_level
     label = "Democratic Seats"
   }
   
-  plot = ggplot(scores, aes(x = .data[[seat_col]])) +
+  plot = ggplot(scores, aes_string(x = seat_col)) +
     geom_histogram(binwidth = 1, fill = color, alpha = 0.7, color = dark_color) +
-    geom_vline(xintercept = max(scores[[seat_col]]), linetype = "dashed", color = dark_color) +
+    geom_vline(xintercept = max(scores[[seat_col]]), linetype = "dashed", color = dark_color, size = 1) +
     labs(
       title = paste(stringr::str_to_title(party_type), "Gerrymander Ensemble -", stringr::str_to_title(segregation_level)),
       subtitle = paste("Best:", max(scores[[seat_col]]), "seats out of", nrow(scores), "attempts"),
@@ -1814,7 +1832,7 @@ plot_cross_level_comparison = function(all_results, output_dir, n_districts) {
   }
 }
 
-# 4. MAIN VISUALIZATION CREATION FUNCTIONS 
+# 4. MAIN VISUALIZATION CREATION FUNCTIONS (updated to use new names)
 
 # Create initial visualizations for a segregation level
 create_initial_visualizations = function(precincts, map_data_formatted, output_dir, level) {
@@ -2031,7 +2049,7 @@ create_ensemble_visualizations = function(summaries, output_dir, segregation_lev
 
 # 5. GALLERY OF DISTRICTING PLANS
 
-# Winners-by-district small map (districts outlined) ----
+# Winners-by-district small map (precincts outlined) ----
 plot_winner_small = function(map_sf, assignment_vec, 
                              district_border_color = "black",
                              district_border_width = 0.9,
@@ -2094,8 +2112,8 @@ build_party_grid_page = function(level_dir, title = "Segregation Level") {
   # Standardize column names used downstream
   map_sf = dplyr::rename(
     map_sf,
-    precinct_id = pct_id,
-    population  = pop
+    precinct_id = dplyr::coalesce("precinct_id", "pct_id"),
+    population  = dplyr::coalesce("population",  "pop")
   )
   
   # Helper to read a plan csv safely
@@ -2158,7 +2176,6 @@ build_party_grid_page = function(level_dir, title = "Segregation Level") {
 
 # Export a single 3-page PDF (low/medium/high) ----
 export_plan_gallery_3pages = function(main_output_dir, file_name = "plan_gallery_by_seg_level_plan_type.pdf") {
-  
   levels = c("low","medium","high")
   pages  = list(
     build_party_grid_page(file.path(main_output_dir, "low"),    "LOW segregation"),
@@ -2171,6 +2188,8 @@ export_plan_gallery_3pages = function(main_output_dir, file_name = "plan_gallery
   grDevices::dev.off()
   message("Wrote 3-page gallery: ", out)
 }
+
+
 
 # ===================================================================
 # =============== PART 5: MAIN ANALYSIS FUNCTIONS ===================
@@ -2216,8 +2235,24 @@ simulate_segregation_scenarios = function(n_precincts       = 2600,
     seed = seed
   )
   
-  # Step 2: Assign baseline votes
-  cat("=== ADDING BASELINE VOTES ===\n")
+  # # (OLD) 
+  # # Step 2: Assign voting preferences
+  # cat("\n=== ASSIGNING VOTING PREFERENCES ===\n")
+  # fixed_population_with_votes = add_voting_behavior(
+  #   fixed_population,
+  #   prob_minority_dem = prob_minority_dem,
+  #   prob_majority_dem = prob_majority_dem,
+  #   sd_minority = sd_minority,
+  #   sd_majority = sd_majority,
+  #   voting_model = voting_model,
+  #   rho = rho,
+  #   b_min_context = b_min_context,
+  #   b_maj_context = b_maj_context,
+  #   sigma_precinct = sigma_precinct,
+  #   seed = seed + 1
+  # )
+  
+  # Step 2: Assign voting preferences
   fixed_population = add_baseline_votes(
     fixed_population,
     prob_minority_dem, prob_majority_dem, sd_minority, sd_majority, rho,
@@ -2237,17 +2272,39 @@ simulate_segregation_scenarios = function(n_precincts       = 2600,
     seed = seed + 2
   )
   
-  # Step 4: Assign population to precinct geographies
+  # Step 4: Assign population with improved spatial assignment
   results = list()
   
   for (level in c("low", "medium", "high")) {
-    cat("\n--- Assigning population with", level, "segregation ---\n")
+    cat("\n--- Assigning population with",
+        level,
+        "segregation ---\n")
     
     spatial_precincts = place_voters_on_map(
       fixed_population,
       grid_result,
       segregation_level = level,
       seed = seed + which(c("low", "medium", "high") == level) + 2
+    )
+    
+    # (NEW) assign votes *after* placement using spatial fields
+    spatial_precincts = apply_vote_model(
+      spatial_precincts  = spatial_precincts,
+      voting_model       = voting_model,
+      prob_minority_dem  = prob_minority_dem,
+      prob_majority_dem  = prob_majority_dem,
+      sd_minority        = sd_minority,
+      sd_majority        = sd_majority,
+      rho                = rho,
+      b_min_context      = b_min_context,
+      b_maj_context      = b_maj_context,
+      sigma_precinct     = sigma_precinct,
+      field_rho          = field_rho,   
+      shared_field_wt    = shared_field_wt,   
+      shared_field_rho   = shared_field_rho,
+      use_base_probs     = TRUE, 
+      base_shrink_lambda = 1.0,            # 0.6–0.8 for extra randomness
+      seed               = seed + 10       # keep same across levels to isolate placement
     )
     
     results[[level]] = list(precincts = spatial_precincts, centers = grid_result$centers)
@@ -2276,7 +2333,7 @@ simulate_segregation_scenarios = function(n_precincts       = 2600,
 }
 
 # Main redistricting loop with cleaner directory structure
-analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
+analyze_redistricting_impact = function(output_base_dir      = "Output/",
                                         n_precincts          = 2600,
                                         n_centers            = 5,
                                         input_data           = NULL,
@@ -2312,11 +2369,20 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
                                         soft_k               = 60,
                                         simplify_tolerance   = NA,
                                         score_models         = FALSE,
-                                        ex_post_vote_models  = NULL,
+                                        save_every_steps     = 50,
+                                        resume               = TRUE,
                                         random_seed          = 123) {
   
   set.seed(random_seed)
+ 
+
+  levels_to_run = strsplit(Sys.getenv("SEG_LEVELS", "low, medium, high"), ",")[[1]]
+  levels_to_run = intersect(c("low","medium","high"), trimws(tolower(levels_to_run)))
   
+  if (length(levels_to_run) == 0) {
+    stop("SEG_LEVELS did not include any of: low, medium, high")  
+  } 
+
   # Run the improved fixed population simulation
   cat("=== RUNNING SIMULATION ===\n")
   simulation_results = simulate_segregation_scenarios(
@@ -2349,7 +2415,7 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
   
   # Create main output directory
   timestamp = format(Sys.time(), "%Y%m%d_%H%M%S")
-  main_output_dir = paste0(output_base_dir, "test_", timestamp, "/")
+  main_output_dir = paste0(output_base_dir) # , "test_", timestamp, "/")
   dir.create(main_output_dir, recursive = TRUE, showWarnings = FALSE)
   
   # Save the fixed population data in root directory
@@ -2423,12 +2489,12 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
   )
   
   # Define segregation levels
-  segregation_levels = c("low", "medium", "high")
+  # segregation_levels = c("low", "medium", "high")
   all_results = list()
   results_for_comp_plots = list()
   
   # Loop through each segregation level
-  for (current_level in segregation_levels) {
+  for (current_level in levels_to_run) {
     cat(paste0(
       "\n\n===== PROCESSING SEGREGATION LEVEL: ",
       toupper(current_level),
@@ -2448,7 +2514,7 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
       )
     }
     dir.create(paste0(current_output_dir, "figures"), recursive = TRUE, showWarnings = FALSE)
-    
+   
     # Use baseline votes that were simulated BEFORE spatial placement
     precincts_baseline = simulation_results[[current_level]]$precincts
     
@@ -2468,8 +2534,7 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     
     map_data_formatted = sf::st_make_valid(map_data_formatted)
     map_data_formatted = sf::st_simplify(map_data_formatted, dTolerance = 0.5)
-    
-    # Run all three types of redistricting
+
     cat("\nRunning redistricting analyses...\n")
     
     redistricting_results = list()
@@ -2490,7 +2555,9 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
         num_bursts            = num_bursts,
         patience_bursts       = patience_bursts,
         soft_k                = soft_k,
-        simplify_tolerance    = simplify_tolerance
+        simplify_tolerance    = simplify_tolerance,
+        save_every_steps      = save_every_steps,
+        resume                = TRUE
       )
       
       # Read shapefile back for processing
@@ -2511,6 +2578,8 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
           dem_voteshare_minority = dem_vsh_1,
           dem_voteshare_majority = dem_vsh_0
         )
+      
+      cat("\nProcessing redistricting results...\n")
       
       cat("\nProcessing redistricting results (BASELINE)...\n")
       baseline_summaries = process_redistricting_results(
@@ -2580,13 +2649,13 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     }, error = function(e) {
       cat("ERROR in redistricting for", current_level, ":", e$message, "\n")
     })
-    
+
     # Store results
     all_results[[current_level]]$summaries = baseline_summaries
     if (exists("model_summaries") && length(model_summaries)) {
       all_results[[current_level]]$model_summaries = model_summaries
     }
-    
+
   }
   
   comparisons_dir = paste0(main_output_dir, "comparisons/")
@@ -2608,6 +2677,14 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
   # Gallery of plans
   export_plan_gallery_3pages(main_output_dir)
   
+  if (any(sapply(all_results, function(x) !is.null(x$summaries)))) {
+    tryCatch({
+      export_plan_gallery_3pages(main_output_dir)
+    }, error = function(e) {
+      cat("Could not create plan gallery:", e$message, "\n")
+    })
+  }
+
   cat("\n=== ANALYSIS COMPLETE ===\n")
   cat("Results saved to:", main_output_dir, "\n")
   

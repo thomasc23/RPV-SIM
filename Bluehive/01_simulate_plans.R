@@ -1,6 +1,17 @@
+# Check for required packages
+required_packages <- c("sf", "spatstat", "viridis", "spdep", 
+                       "truncnorm", "tmvtnorm", "patchwork", "data.table", 
+                        "tidyverse", "reticulate")
+
+missing_packages <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  stop(paste("Missing required packages:", paste(missing_packages, collapse = ", "),
+             "\nRun install_r_packages.sh to install them"))
+}
+
 # Load required libraries
 library(sf)
-library(lwgeom)
 library(spatstat)
 library(viridis)
 library(spdep)
@@ -8,18 +19,14 @@ library(truncnorm)
 library(tmvtnorm)
 library(patchwork)
 library(data.table)
-library(MASS)  
 library(tidyverse)
 
 # Set working directory 
-setwd('~/Dropbox/RPV/Code/Simulation/')
-
-rm(list = ls())
+base_dir <- Sys.getenv("BASE_DIR", getwd())
+setwd(base_dir)
 
 # Source auxiliary functions and North Carolina precinct-level demographic data
 source('R/auxiliary.R')
-nc_pop = read_csv('~/Dropbox/RPV/Data/Clean/NC_precinct_votes_and_pop_by_race.csv')
-
 
 # ===================================================================
 # ==================== SIMULATION PARAMETERS ========================
@@ -59,30 +66,26 @@ run_sim = function() {
   RANDOM_SEED        = 14
   
   # Redistricting parameters
-  N_PLANS            = 100 # Size of neutral map ensemble
-  ENSEMBLE_SIZE      = 10 # Size of biased map ensemble  
+  # --- env var defaults (strings), safe on fresh R sessions ---
   POP_DEVIATION      = 0.01
-  
-  # ENSEMBLE_SIZE = 25–30
-  # BURST_LENGTH = 400
-  # NUM_BURSTS = 24 # planned steps = 9,600
-  # PATIENCE_BURSTS = 6
-  
+  N_PLANS            = as.integer(Sys.getenv("N_PLANS",         "100"))
+  ENSEMBLE_SIZE      = as.integer(Sys.getenv("ENSEMBLE_SIZE",   "20"))
+  BURST_LENGTH       = as.integer(Sys.getenv("BURST_LENGTH",    "150"))
+  NUM_BURSTS         = as.integer(Sys.getenv("NUM_BURSTS",      "15"))
+  PATIENCE_BURSTS    = as.integer(Sys.getenv("PATIENCE_BURSTS", "6"))
+  SOFT_K             = as.numeric(Sys.getenv("SOFT_K",          "60"))
+  SIMPLIFY_TOL       = if (nzchar(Sys.getenv("SIMPLIFY_TOL",""))) as.numeric(Sys.getenv("SIMPLIFY_TOL")) else NA
+  RANDOM_SEED        = as.integer(Sys.getenv("RANDOM_SEED",     "123"))
+  OUTPUT_BASE_DIR    = Sys.getenv("OUTPUT_BASE_DIR", "Output/")
+
   # Short burst optimizer / dev parameters
-  DEV_MODE            = TRUE
-  BURST_LENGTH        = 5     # steps per burst
-  NUM_BURSTS          = 5    # number of bursts (iterations)
-  PATIENCE_BURSTS     = 5     # optional early stop after N bad bursts
-  SOFT_K              = 60    # (unchanged) steepness for soft seats
-  SIMPLIFY_TOL        = NA    # numeric or NA
+  DEV_MODE           = tolower(Sys.getenv("DEV_MODE", "true")) %in% c("1","true","yes","t")
   
-  SCORE_MODELS        = FALSE
-  EX_POST_VOTE_MODELS  = NULL
+  # ITERATIVE SAVING
   
-  
-  
-  # Output directory
-  OUTPUT_BASE_DIR    = "Output/Tests/"
+  SAVE_EVERY_STEPS   = as.integer(Sys.getenv("SAVE_EVERY_STEPS", "50"))
+  RESUME             = TRUE 
+  SCORE_MODELS       = FALSE
   
   # Run the analysis
   results = analyze_redistricting_impact(
@@ -123,7 +126,8 @@ run_sim = function() {
     soft_k             = SOFT_K,
     simplify_tolerance = SIMPLIFY_TOL,
     score_models       = SCORE_MODELS,
-    ex_post_vote_models = EX_POST_VOTE_MODELS
+    save_every_steps   = SAVE_EVERY_STEPS,
+    resume             = RESUME
   )
   
   # Verify consistency
