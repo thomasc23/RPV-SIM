@@ -20,6 +20,7 @@ Scripts/
 Simulated Shapefiles/
 Simulating Plans/
 Workflow/
+data/*
 
 # Files to ignore
 sim_population_tc.R
