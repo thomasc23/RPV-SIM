@@ -41,7 +41,7 @@ short_mp_mk = function(mp_mk_type) {
 #'         <anything>.csv  (columns: precinct, district)
 #' @param data_root char
 #' @return tibble with agg_level, mm_type (available subsets), and existing files
-find_scenarios = function(data_root = "data") {
+find_scenarios = function(data_root = "data/Simulated Plans") {
   stopifnot(fs::dir_exists(data_root))
   
   agg_levels = c("low", "medium", "high")

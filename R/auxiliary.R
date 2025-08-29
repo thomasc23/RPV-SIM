@@ -1228,21 +1228,21 @@ run_redistricting = function(shapefile_path,
   message("\nRunning neutral redistricting analysis...")
   results$neutral = py$run_redistricting_analysis(
     shapefile_path = shapefile_path,
-    output_dir = paste0(output_dir, "neutral/"),
-    num_steps = as.integer(num_steps),
-    pop_deviation = as.numeric(pop_deviation),
-    num_districts = as.integer(num_districts)
+    output_dir     = paste0(output_dir, "neutral/"),
+    num_steps      = as.integer(num_steps),
+    pop_deviation  = as.numeric(pop_deviation),
+    num_districts  = as.integer(num_districts)
   )
   
   # 2. Republican gerrymander ensemble
   message("\nRunning Republican gerrymandering ensemble...")
   results$republican = py$create_biased_ensemble(
-    shapefile_path = shapefile_path,
-    output_dir = paste0(output_dir, "republican/"),
-    ensemble_size = as.integer(ensemble_size),
-    bias_type = "republican",
-    pop_deviation = as.numeric(pop_deviation),
-    num_districts = as.integer(num_districts),
+    shapefile_path     = shapefile_path,
+    output_dir         = paste0(output_dir, "republican/"),
+    ensemble_size      = as.integer(ensemble_size),
+    bias_type          = "republican",
+    pop_deviation      = as.numeric(pop_deviation),
+    num_districts      = as.integer(num_districts),
     # Dev mode parameters
     dev_mode           = dev_mode,
     burst_length       = as.integer(burst_length),
@@ -1255,12 +1255,12 @@ run_redistricting = function(shapefile_path,
   # 3. Democratic gerrymander ensemble
   message("\nRunning Democratic gerrymandering ensemble...")
   results$democratic = py$create_biased_ensemble(
-    shapefile_path = shapefile_path,
-    output_dir = paste0(output_dir, "democratic/"),
-    ensemble_size = as.integer(ensemble_size),
-    bias_type = "democratic",
-    pop_deviation = as.numeric(pop_deviation),
-    num_districts = as.integer(num_districts),
+    shapefile_path     = shapefile_path,
+    output_dir         = paste0(output_dir, "democratic/"),
+    ensemble_size      = as.integer(ensemble_size),
+    bias_type          = "democratic",
+    pop_deviation      = as.numeric(pop_deviation),
+    num_districts      = as.integer(num_districts),
     # Dev mode parameters
     dev_mode           = dev_mode,
     burst_length       = as.integer(burst_length),
@@ -2617,6 +2617,272 @@ analyze_redistricting_impact = function(output_base_dir      = "Output/Tests/",
     simulation_results = simulation_results
   )
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# (NEW) State - specific redistricting (TEXAS)
+
+
+# Allocate an integer (v) to groups by weights (sum to 1)
+# Enforce minimal rounding error
+int_alloc_by_weights = function(V, w) {
+  w[is.na(w)] = 0
+  
+  if (sum(w) <= 0 || V <= 0) return(integer(length(w)))
+  
+  w = w / sum(w)
+  raw = V * w
+  base = floor(raw)
+  diff = V - sum(base)
+  
+  if (diff > 0) {
+    frac = raw - base
+    add_order = order(frac, decreasing = TRUE)
+    for (i in seq_len(diff)) base[add_order[i]] = base[add_order[i]] + 1L
+  } else if (diff < 0) {
+    # shouldn't really happen
+    sub_order = order((raw - base), decreasing = FALSE)
+    for (i in seq_len(abs(diff))) {
+      j = sub_order[i]
+      if (base[j] > 0) base[j] = base[j] - 1L
+    }
+  }
+  as.integer(base)
+}
+
+# Minimal integer adjustment so that sum(group_D) == precinct_dem_total.
+# Adds/subtracts one at a time to groups with most room.
+adjust_group_D_to_match = function(Dg, vg, dem_total) {
+  Dg = as.integer(Dg); vg = as.integer(vg)
+  resid = as.integer(dem_total) - sum(Dg)
+  if (resid == 0L) return(Dg)
+  if (resid > 0L) {
+    # add where we still have Republicans to flip (vg - Dg)
+    room = vg - Dg
+    while (resid > 0L && any(room > 0L)) {
+      j = which.max(room)
+      Dg[j] = Dg[j] + 1L
+      room[j] = room[j] - 1L
+      resid = resid - 1L
+    }
+  } else {
+    # subtract where we have Democratic votes to shave
+    while (resid < 0L && any(Dg > 0L)) {
+      j = which.max(Dg)
+      Dg[j] = Dg[j] - 1L
+      resid = resid + 1L
+    }
+  }
+  Dg
+}
+
+
+# Build a 3x3 correlation matrix from scalars or accept a full matrix
+build_corr = function(rho_wb = 0.5, rho_wh = 0.5, rho_bh = 0.5, R = NULL) {
+  if (!is.null(R)) return(R)
+  R = matrix(c(
+    1,       rho_wb, rho_wh,
+    rho_wb,  1,      rho_bh,
+    rho_wh,  rho_bh, 1
+  ), nrow = 3, byrow = TRUE)
+  # quick PD fix if needed
+  eig = eigen(R, symmetric = TRUE)
+  if (min(eig$values) <= 1e-6) {
+    # shrink toward identity a hair
+    eps = 1e-3
+    R = (1 - eps) * R + eps * diag(3)
+  }
+  R
+}
+
+
+
+# ---------- Core: prepare_tx_for_redistricting ----------
+# Imposes an EI DGP at the precinct level and writes a shapefile.
+prepare_tx_for_redistricting = function(
+    in_shapefile,
+    out_shapefile,
+    # EI hyperparameters (probability scale, truncated to [0,1])
+    ei_means = c(white = 0.35, black = 0.90, hisp = 0.65),
+    ei_sds   = c(white = 0.3, black = 0.10, hisp = 0.12),
+    ei_corr  = list(rho_wb = 0.5, rho_wh = 0.5, rho_bh = 0.5, R = NULL),
+    # Randomness
+    seed = 123,
+    # Geometry simplification
+    simplify_tolerance = NA_real_
+) {
+  set.seed(seed)
+  
+  stopifnot(file.exists(in_shapefile))
+  sf0 = sf::read_sf(in_shapefile) %>%
+    sf::st_make_valid()
+  
+  # Required columns present?
+  need = c("prec_id","dem_votes","rep_votes","cvap_wht","cvap_blk","cvap_hsp")
+  missing = setdiff(need, names(sf0))
+  if (length(missing)) stop("Missing required columns: ", paste(missing, collapse = ", "))
+  
+  # Keep only precincts with observed votes and some CVAP
+  sf1 = sf0 %>%
+    mutate(
+      V_total = as.integer(dem_votes + rep_votes),
+      N_white = pmax(0L, as.integer(round(cvap_wht))),
+      N_black = pmax(0L, as.integer(round(cvap_blk))),
+      N_hisp  = pmax(0L, as.integer(round(cvap_hsp))),
+      N_tot   = N_white + N_black + N_hisp
+    ) %>%
+    filter(V_total > 0, N_tot > 0)
+  
+  if (nrow(sf1) == 0L) stop("No usable precincts after filtering (need positive votes and CVAP).")
+  
+  # Assign votes to groups proportional to CVAP
+  V = sf1$V_total
+  W = sf1$N_white; B = sf1$N_black; H = sf1$N_hisp
+  wts = cbind(W, B, H) / pmax(1L, (W + B + H))
+  vg_mat = matrix(0L, nrow = nrow(sf1), ncol = 3)
+  for (i in seq_len(nrow(sf1))) {
+    vg_mat[i,] = int_alloc_by_weights(V[i], wts[i,])
+  }
+  colnames(vg_mat) = c("v_white","v_black","v_hisp")
+  
+  # EI draws: one 3-vector (p_white, p_black, p_hisp) per precinct from TMVN[0,1]^3
+  means = as.numeric(ei_means[c("white","black","hisp")])
+  sds   = as.numeric(ei_sds[c("white","black","hisp")])
+  R     = build_corr(ei_corr$rho_wb, ei_corr$rho_wh, ei_corr$rho_bh, ei_corr$R)
+  Sigma = diag(sds) %*% R %*% diag(sds)
+  
+  P = tmvtnorm::rtmvnorm(
+    n = nrow(sf1),
+    mean = means,
+    sigma = Sigma,
+    lower = rep(0, 3),
+    upper = rep(1, 3)
+  )
+  colnames(P) = c("p_white","p_black","p_hisp")
+  
+  # Individual-level group votes via Binomial; then minimal integer adjustment to hit precinct dem totals exactly
+  v_white = vg_mat[, 1]; v_black = vg_mat[, 2]; v_hisp = vg_mat[, 3]
+  p_white = P[, 1];      p_black = P[, 2];      p_hisp = P[, 3]
+  
+  D_white = rbinom(nrow(sf1), size = v_white, prob = p_white)
+  D_black = rbinom(nrow(sf1), size = v_black, prob = p_black)
+  D_hisp  = rbinom(nrow(sf1), size = v_hisp,  prob = p_hisp)
+  
+  # Adjust to match observed precinct Democratic totals exactly
+  dem_obs = as.integer(sf1$dem_votes)
+  for (i in seq_len(nrow(sf1))) {
+    Dg = c(D_white[i], D_black[i], D_hisp[i])
+    vg = c(v_white[i], v_black[i], v_hisp[i])
+    Dg2 = adjust_group_D_to_match(Dg, vg, dem_obs[i])
+    D_white[i] = Dg2[1]; D_black[i] = Dg2[2]; D_hisp[i] = Dg2[3]
+  }
+  
+  # Build outputs (collapse to majority/minority for downstream)
+  rep_obs = as.integer(sf1$rep_votes)
+  V_check = D_white + D_black + D_hisp + (rep_obs) # not used—just sanity
+  # Group reps derived from v_g - D_g to keep totals exact
+  R_white = v_white - D_white
+  R_black = v_black - D_black
+  R_hisp  = v_hisp  - D_hisp
+  
+  # Majority = White; Minority = Black + Hispanic
+  n_min   = as.integer(v_black + v_hisp)
+  n_maj   = as.integer(v_white)
+  dem_min = as.integer(D_black + D_hisp)
+  dem_maj = as.integer(D_white)
+  rep_min = n_min - dem_min
+  rep_maj = n_maj - dem_maj
+  
+  pop_turnout = as.integer(dem_obs + rep_obs)  # population used by seat calc = observed turnout
+  
+  # Shares (guard zero-denominators)
+  safe_div = function(a, b) ifelse(b > 0, a/b, 0)
+  
+  out = sf1 %>%
+    mutate(
+      pct_id    = seq_len(nrow(sf1)),
+      orig_id   = prec_id,
+      pop       = pop_turnout,
+      n_min     = n_min,
+      n_maj     = n_maj,
+      dem_v     = dem_obs,
+      rep_v     = rep_obs,
+      dem_v_min = dem_min,
+      rep_v_min = rep_min,
+      dem_v_maj = dem_maj,
+      rep_v_maj = rep_maj,
+      pct_min   = safe_div(n_min, pmax(1L, pop_turnout)),
+      dem_vsh   = safe_div(dem_obs, pmax(1L, pop_turnout)),
+      dem_vsh_1 = safe_div(dem_min, pmax(1L, n_min)),  # minority D share
+      dem_vsh_0 = safe_div(dem_maj, pmax(1L, n_maj))   # majority D share
+    ) %>%
+    # Keep only the columns your pipeline expects + geometry
+    select(pct_id, orig_id, pop, n_min, n_maj,
+           dem_v, rep_v, dem_v_min, rep_v_min, dem_v_maj, rep_v_maj,
+           pct_min, dem_vsh, dem_vsh_1, dem_vsh_0, geometry)
+  
+
+  
+  # --- CRS + topology cleaning (projected, snapped, valid) ---
+  # if (is.na(sf::st_crs(out))) sf::st_crs(out) = 4326
+  # out = sf::st_transform(out, 3083)   # Texas Centric Albers (meters)
+  # out = sf::st_set_precision(out, 1000)  # 1 m grid
+  # out = sf::st_make_valid(out)
+  # out = lwgeom::st_snap_to_grid(out, 1000)
+  # out = sf::st_buffer(out, 0)
+  
+  # Optional simplify in meters (keep small to preserve topology)
+  if (!is.na(simplify_tolerance) && is.finite(simplify_tolerance) && simplify_tolerance > 0) {
+    out = sf::st_simplify(out, dTolerance = simplify_tolerance, preserveTopology = TRUE)
+    out = sf::st_make_valid(out)
+  }
+  
+  dir.create(dirname(out_shapefile), recursive = TRUE, showWarnings = FALSE)
+  sf::st_write(out, out_shapefile, append = FALSE, quiet = TRUE)
+  
+  # Quick integrity checks
+  stopifnot(sum(out$dem_v + out$rep_v) == sum(pop_turnout))
+  stopifnot(all(out$dem_v == out$dem_v_min + out$dem_v_maj))
+  stopifnot(all(out$rep_v == out$rep_v_min + out$rep_v_maj))
+  
+  message("Wrote shapefile with EI-imposed group votes: ", out_shapefile)
+  invisible(out)
+}
+
+
+
+
+
+
+
+
+
+
 
 
 

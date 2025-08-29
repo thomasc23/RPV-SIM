@@ -87,7 +87,11 @@ def run_redistricting_analysis(
     
     # Create graph from GeoDataFrame
     print("Creating graph from GeoDataFrame")
-    graph = Graph.from_geodataframe(gdf)
+    graph = Graph.from_geodataframe(
+      gdf,
+      adjacency = 'queen',
+      ignore_errors = True
+      )
     
     # Add population data to graph
     for node in graph.nodes():
@@ -352,7 +356,11 @@ def create_biased_ensemble(
     assert not missing, f"Shapefile missing required columns: {missing}"
 
     # -------- Build graph --------
-    graph = Graph.from_geodataframe(gdf)
+    graph = Graph.from_geodataframe(
+      gdf,
+      adjacency = 'queen',
+      ignore_errors = True
+      )
     for node in graph.nodes():
         graph.nodes[node]["population"] = int(gdf.iloc[node]["population"])
         graph.nodes[node]["dem_v"]      = int(gdf.iloc[node]["dem_v"])
