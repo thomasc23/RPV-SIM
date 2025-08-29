@@ -31,3 +31,6 @@ wasted_votes_analysis_may30.R
 04_make_tables.R
 05_make_figures.R
 05b_make_precinct_figures.R
+
+# Catch all for large spatial data objects
+*.shp *.shx *.dbf *.prj *.cpg *.gpkg *.geoparquet *.parquet *.feather *.rds *.zip *.tif
