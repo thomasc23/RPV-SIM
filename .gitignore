@@ -6,7 +6,7 @@
 .Ruserdata
 
 # Python specific
-__pychache__/
+__pycache__/
 .ipynb_checkpoints/
 
 # OS specific
