@@ -3,17 +3,17 @@
 # Links 'sf' against conda-forge GDAL/GEOS/PROJ already exported by the job.
 
 setRepositories(ind=1) # CRAN
-repos <- c(CRAN="https://cloud.r-project.org")
+repos = c(CRAN="https://cloud.r-project.org")
 options(repos=repos, Ncpus = max(1L, parallel::detectCores()-1L))
 .libPaths(Sys.getenv("R_LIBS_USER"))
 
-need <- c(
-  "reticulate","sf","spdep","truncnorm","tmvtnorm","patchwork",
+need = c(
+  "reticulate","sf","spdep","truncnorm","tmvtnorm","patchwork", "lwgeom",
   "data.table","MASS","tidyverse","viridis","spatstat" # meta pulls split pkgs
 )
 
-have <- rownames(installed.packages())
-todo <- setdiff(need, have)
+have = rownames(installed.packages())
+todo = setdiff(need, have)
 
 if (length(todo)) {
   message("[R install] Installing: ", paste(todo, collapse=", "))

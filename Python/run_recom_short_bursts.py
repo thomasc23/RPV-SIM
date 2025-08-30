@@ -21,6 +21,36 @@ from functools import partial
 import matplotlib.pyplot as plt
 
 
+def _normalize_gdf_for_chain(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Ensure expected names/dtypes: pct_id, population, dem_v, rep_v."""
+    gdf = gdf.reset_index(drop=True).copy()
+
+    rename_map = {}
+    if "precinct_id" in gdf.columns and "pct_id" not in gdf.columns:
+        rename_map["precinct_id"] = "pct_id"
+    if "pop" in gdf.columns and "population" not in gdf.columns:
+        rename_map["pop"] = "population"
+    # Keep dem_v/rep_v as-is; many pipelines already use these names.
+    gdf = gdf.rename(columns=rename_map)
+
+    required = {"pct_id", "population", "dem_v", "rep_v"}
+    missing = [c for c in required if c not in gdf.columns]
+    if missing:
+        raise ValueError(f"Shapefile missing required columns: {missing}")
+
+    gdf["pct_id"] = gdf["pct_id"].astype(int)
+    gdf["population"]    = gdf["population"].fillna(0).astype(int)
+    gdf["dem_v"]  = gdf["dem_v"].fillna(0).astype(int)
+    gdf["rep_v"]  = gdf["rep_v"].fillna(0).astype(int)
+
+    # shares can exist for other analytics; not used for seats
+    for c in ("dem_voteshare", "rep_voteshare"):
+        if c in gdf.columns:
+            gdf[c] = gdf[c].astype(float)
+
+    return gdf
+
+
 def run_redistricting_analysis(
     shapefile_path, 
     output_dir, 
@@ -56,7 +86,7 @@ def run_redistricting_analysis(
     gdf = gpd.read_file(shapefile_path)
     
     # Check for required columns
-    required_columns = ["pct_id", "pop", "pct_min", "dem_vsh"]
+    required_columns = ["pct_id", "pop", "dem_v", "rep_v"]
     missing_columns = [col for col in required_columns if col not in gdf.columns]
     
     if missing_columns:
@@ -71,11 +101,23 @@ def run_redistricting_analysis(
     column_mapping = {
         "pct_id": "precinct_id", 
         "pop": "population", 
-        "pct_min": "per_minority", 
-        "dem_vsh": "dem_voteshare"
+        "dem_v": "dem_votes",
+        "rep_v": "rep_votes"
     }
     
     gdf = gdf.rename(columns=column_mapping)
+    
+    # ---- Ensure vote COUNTS exist and are ints ----
+    if "dem_v" not in gdf.columns or "rep_v" not in gdf.columns:
+        raise ValueError("Expected vote count columns 'dem_v' and 'rep_v' in the shapefile.")
+    gdf["dem_v"] = gdf["dem_v"].fillna(0).astype(int)
+    gdf["rep_v"] = gdf["rep_v"].fillna(0).astype(int)
+    
+    # keep shares for other uses, but they are NOT used for seats
+    if "dem_voteshare" in gdf.columns:
+        gdf["dem_voteshare"] = gdf["dem_voteshare"].fillna(0.0).astype(float)
+    if "rep_voteshare" in gdf.columns:
+        gdf["rep_voteshare"] = gdf["rep_voteshare"].fillna(0.0).astype(float)
     
     # Calculate additional columns if needed
     if "per_minority" in gdf.columns and "population" in gdf.columns:
@@ -89,16 +131,14 @@ def run_redistricting_analysis(
     print("Creating graph from GeoDataFrame")
     graph = Graph.from_geodataframe(
       gdf,
-      adjacency = 'queen',
+      adjacency = 'rook',
       ignore_errors = True
       )
     
-    # Add population data to graph
     for node in graph.nodes():
-        graph.nodes[node]["population"] = gdf.loc[node, "population"]
-        if "dem_voteshare" in gdf.columns:
-            graph.nodes[node]['dem_voteshare'] = gdf.loc[node, 'dem_voteshare']
-            graph.nodes[node]['rep_voteshare'] = gdf.loc[node, 'rep_voteshare']
+      graph.nodes[node]["population"] = int(gdf.loc[node, "population"])
+      graph.nodes[node]["dem_v"]      = int(gdf.loc[node, "dem_v"])
+      graph.nodes[node]["rep_v"]      = int(gdf.loc[node, "rep_v"])
     
     # Calculate total population
     total_population = sum(gdf['population'])
@@ -118,13 +158,12 @@ def run_redistricting_analysis(
     print(f"Ideal population per district: {ideal_population}")
     
     # Set up Election
-    election = Election("ELECTION", {"Dem": "dem_voteshare", "Rep": 'rep_voteshare'})
-    
-    # Set up updaters
+    election = Election("E0", {"D": "dem_v", "R": "rep_v"})
+
     my_updaters = {
-        'population': Tally('population'),
-        'cut_edges': cut_edges,
-        'ELECTION': election
+        "population": Tally("population"),
+        "cut_edges": cut_edges,
+        "E0": election
     }
     
     # Create initial partition
@@ -186,10 +225,10 @@ def run_redistricting_analysis(
             metrics.append({
                 "step": i,
                 "cut_edges": len(partition["cut_edges"]),
-                "efficiency_gap": efficiency_gap(partition["ELECTION"]),
-                "mean_median": mean_median(partition["ELECTION"]),
-                "dem_seats": partition["ELECTION"].wins("Dem"),
-                "rep_seats": partition["ELECTION"].wins("Rep")
+                "efficiency_gap": efficiency_gap(partition["E0"]),
+                "mean_median": mean_median(partition["E0"]),
+                "dem_seats": partition["E0"].wins("Dem"),
+                "rep_seats": partition["E0"].wins("Rep")
             })
             
             CD_assignments.append({
@@ -288,9 +327,26 @@ def save_neutral_results(metrics, CD_assignments, gdf, output_dir):
         for i, row in enumerate(df_assignments['district_id']):
             all_assignments[:, i] = row
         
-        df_pivoted = pd.DataFrame(all_assignments, columns=[f'step_{i+1}' for i in range(num_steps_completed)])
-        df_pivoted['precinct_id'] = gdf['precinct_id']
-        df_pivoted['init_CD'] = gdf['init_CD']
+        df_pivoted = pd.DataFrame(
+          all_assignments,
+          columns=[f"step_{i+1}" for i in range(num_steps_completed)]
+          )
+        
+        df_pivoted["precinct_id"] = gdf["precinct_id"].astype(int)
+
+        # NEW: carry through vendor id if present
+        if "orig_id" in gdf.columns:
+            df_pivoted["orig_id"] = gdf["orig_id"].astype(str)
+        else:
+            # fallback: mirror precinct_id as string
+            df_pivoted["orig_id"] = gdf["precinct_id"].astype(str)
+        
+        df_pivoted["init_CD"] = gdf["init_CD"].astype(int)
+        
+        # reorder for convenience
+        first_cols = ["precinct_id", "orig_id", "init_CD"]
+        step_cols  = [c for c in df_pivoted.columns if c.startswith("step_")]
+        df_pivoted = df_pivoted[first_cols + step_cols]
         
         plan_output_path = os.path.join(output_dir, "CD_plans.csv")
         df_pivoted.to_csv(plan_output_path, index=False)
@@ -358,7 +414,7 @@ def create_biased_ensemble(
     # -------- Build graph --------
     graph = Graph.from_geodataframe(
       gdf,
-      adjacency = 'queen',
+      adjacency = 'rook',
       ignore_errors = True
       )
     for node in graph.nodes():
@@ -378,7 +434,7 @@ def create_biased_ensemble(
 
     # RECOM proposal
     node_repeats = 1 if dev_mode else 3
-    max_attempts = 800 if dev_mode else 5000
+    max_attempts = 800 if dev_mode else 5000 
     proposal = partial(
         recom,
         pop_col="population",
@@ -545,8 +601,18 @@ def create_biased_ensemble(
     if plan_assignments:
         plans_df = pd.DataFrame(plan_assignments).T
         plans_df.columns = [f"{bias_type}_map_{i}" for i in range(len(plan_assignments))]
-        plans_df["precinct_id"] = gdf["precinct_id"].values
-        plans_df = plans_df[["precinct_id"] + [c for c in plans_df.columns if c != "precinct_id"]]
+        plans_df["precinct_id"] = gdf["precinct_id"].astype(int).values
+        
+        # NEW: include vendor id if present
+        if "orig_id" in gdf.columns:
+            plans_df["orig_id"] = gdf["orig_id"].astype(str).values
+        else:
+            plans_df["orig_id"] = plans_df["precinct_id"].astype(str).values
+        
+        # reorder columns
+        map_cols = [c for c in plans_df.columns if c.startswith(f"{bias_type}_map_")]
+        plans_df = plans_df[["precinct_id", "orig_id"] + map_cols]
+        
         plans_df.to_csv(os.path.join(output_dir, "CD_plans.csv"), index=False)
 
         metrics_df = pd.DataFrame(metrics_records)

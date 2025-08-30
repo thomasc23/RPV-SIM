@@ -1,9 +1,9 @@
 # Check for required packages
-required_packages <- c("sf", "spatstat", "viridis", "spdep", 
+required_packages = c("sf", "spatstat", "viridis", "spdep", 
                        "truncnorm", "tmvtnorm", "patchwork", "data.table", 
                         "tidyverse", "reticulate")
 
-missing_packages <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+missing_packages = required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
 
 if (length(missing_packages) > 0) {
   stop(paste("Missing required packages:", paste(missing_packages, collapse = ", "),
@@ -22,7 +22,7 @@ library(data.table)
 library(tidyverse)
 
 # Set working directory 
-base_dir <- Sys.getenv("BASE_DIR", getwd())
+base_dir = Sys.getenv("BASE_DIR", getwd())
 setwd(base_dir)
 
 # Source auxiliary functions and North Carolina precinct-level demographic data

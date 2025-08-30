@@ -4,37 +4,38 @@ library(sf)
 library(rmapshaper)
 library(patchwork)
 library(RColorBrewer)
+library(tidyverse)
 
 rm(list = ls())
 
-tx16 = read_sf('data/States/TX/out/tx_16.geojson') 
-tx20 = read_sf('data/States/TX/out/tx_20.geojson')
-tx24 = read_sf('data/States/TX/out/tx_24.geojson')
+# tx16 = read_sf('data/States/TX/out/tx_16.shp') 
+# tx20 = read_sf('data/States/TX/out/tx_20.shp')
+tx24 = read_sf('data/States/TX/out/tx_24.shp')
 
-tx_16_simple = ms_simplify(tx16, keep = 0.05, keep_shapes = TRUE)
-tx_20_simple = ms_simplify(tx20, keep = 0.05, keep_shapes = TRUE)
+# tx_16_simple = ms_simplify(tx16, keep = 0.05, keep_shapes = TRUE)
+# tx_20_simple = ms_simplify(tx20, keep = 0.05, keep_shapes = TRUE)
 tx_24_simple = ms_simplify(tx24, keep = 0.05, keep_shapes = TRUE)
 
-tx_16_simple$hisp_share = tx_16_simple$cvap_hispanic / tx_16_simple$cvap_tot * 100
-tx_20_simple$hisp_share = tx_20_simple$cvap_hispanic / tx_20_simple$cvap_tot * 100
-tx_24_simple$hisp_share = tx_24_simple$cvap_hispanic / tx_24_simple$cvap_tot * 100
+# tx_16_simple$hisp_share = tx_16_simple$cvap_hispanic / tx_16_simple$cvap_tot * 100
+# tx_20_simple$hisp_share = tx_20_simple$cvap_hispanic / tx_20_simple$cvap_tot * 100
+tx_24_simple$hisp_share = tx_24_simple$cvap_hsp / tx_24_simple$cvap_tot * 100
 
 
 
 
-p16 = ggplot(tx_16_simple) +
-  geom_sf(aes(fill = hisp_share), color = 'black', linewidth = 0.1) +
-  scale_fill_distiller(palette = 'Greens', 
-                       direction = 1,
-                       name = 'Hispanic % of CVAP') +
-  theme_void()
-
-p20 = ggplot(tx_20_simple) +
-  geom_sf(aes(fill = hisp_share), color = 'black', linewidth = 0.1) +
-  scale_fill_distiller(palette = 'Greens', 
-                       direction = 1,
-                       name = 'Hispanic % of CVAP') +
-  theme_void()
+# p16 = ggplot(tx_16_simple) +
+#   geom_sf(aes(fill = hisp_share), color = 'black', linewidth = 0.1) +
+#   scale_fill_distiller(palette = 'Greens', 
+#                        direction = 1,
+#                        name = 'Hispanic % of CVAP') +
+#   theme_void()
+# 
+# p20 = ggplot(tx_20_simple) +
+#   geom_sf(aes(fill = hisp_share), color = 'black', linewidth = 0.1) +
+#   scale_fill_distiller(palette = 'Greens', 
+#                        direction = 1,
+#                        name = 'Hispanic % of CVAP') +
+#   theme_void()
 
 p24 = ggplot(tx_24_simple) +
   geom_sf(aes(fill = hisp_share), color = 'black', linewidth = 0.1) +
@@ -44,8 +45,22 @@ p24 = ggplot(tx_24_simple) +
   theme_void()
 
 
+p24
 
-p16 + p20 + p24 + plot_layout(nrow = 1)
+
+ggplot(tx_24_simple) +
+  geom_sf(aes(fill = (dem_votes) / (dem_votes + rep_votes) * 100), color = 'black', linewidth = 0.1) +
+  scale_fill_gradient2(
+    name = "Dem. 2P Share",
+    low = "#D32F2F",
+    mid = "#F5F5F5",
+    high = "#1976D2",
+    midpoint = 50
+  ) +
+  theme_void()
+
+
+# p16 + p20 + p24 + plot_layout(nrow = 1)
 
 
 
@@ -98,9 +113,9 @@ pr_assigned = pr_assigned %>%
   mutate(
     two_party = rep_votes + dem_votes,
     dem_share = ifelse(two_party > 0, dem_votes / two_party * 100, NA_real_),
-    pct_black = ifelse(cvap_black > 0 & cvap_tot > 0, cvap_black / cvap_tot * 100, NA_real_),
-    pct_hisp = ifelse(cvap_hispanic > 0 & cvap_tot > 0, cvap_hispanic / cvap_tot * 100, NA_real_),
-    pct_white = ifelse(cvap_white > 0 & cvap_tot > 0, cvap_white / cvap_tot * 100, NA_real_)
+    pct_black = ifelse(cvap_blk > 0 & cvap_tot > 0, cvap_blk / cvap_tot * 100, NA_real_),
+    pct_hisp = ifelse(cvap_hsp > 0 & cvap_tot > 0, cvap_hsp / cvap_tot * 100, NA_real_),
+    pct_white = ifelse(cvap_wht > 0 & cvap_tot > 0, cvap_wht / cvap_tot * 100, NA_real_)
   )
 
 plot_df = ms_simplify(pr_assigned, keep = 0.05, keep_shapes = TRUE)

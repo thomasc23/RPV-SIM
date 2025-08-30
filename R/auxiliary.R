@@ -1,5 +1,8 @@
 source('R/setup_python_env.R')
 
+
+safe_div = function(a, b) ifelse(b > 0, a/b, 0)
+
 # ===================================================================
 # ==================== PART 1: GRID GENERATION ======================
 # ===================================================================
@@ -659,42 +662,70 @@ verify_fixed_population_consistency = function(simulation_results) {
   return(TRUE)
 }
 
-create_district_summary = function(map_data, plan_id, cd_plan, plan_precinct_id = NULL) {
+create_district_summary = function(map_data,
+                                   plan_id,
+                                   cd_plan,
+                                   plan_precinct_id = NULL) {
+  df = map_data %>%
+    sf::st_drop_geometry() %>%
+    dplyr::select(
+      precinct_id,
+      population,
+      n_minority,
+      n_majority,
+      dem_votes,
+      rep_votes,
+      dem_votes_minority,
+      dem_votes_majority,
+      per_minority,
+      dem_voteshare,
+      dem_voteshare_minority,
+      dem_voteshare_majority
+    )
   
-  df = map_data %>% st_drop_geometry() %>%
-    select(precinct_id, population, n_minority, n_majority, dem_votes, rep_votes,
-           dem_votes_minority, dem_votes_majority, per_minority, dem_voteshare,
-           dem_voteshare_minority, dem_voteshare_majority)
-  
+  # Align cd_plan to df$precinct_id if needed
   if (!is.null(plan_precinct_id)) {
-    # align
     ord = match(df$precinct_id, plan_precinct_id)
     stopifnot(!any(is.na(ord)))
-    df$district_id = as.integer(cd_plan[ord])
+    stopifnot(length(cd_plan) >= length(ord))
+    df$district_id = as.integer(as.vector(cd_plan[ord]))
   } else {
-    # fallback: assume order already matches
-    df$district_id = as.integer(cd_plan)
+    stopifnot(length(cd_plan) >= nrow(df))
+    df$district_id = as.integer(as.vector(cd_plan))
   }
+  # Hard fail if anything went wrong
+  if (anyNA(df$district_id)) stop("cd_plan produced NA district ids after coercion.")
   
-  district_summary = df %>% group_by(district_id) %>% summarise(
-    n_precincts = n(),
-    population = sum(population),
-    n_minority_voters = sum(n_minority),
-    n_majority_voters = sum(n_majority),
-    dem_votes = sum(dem_votes),
-    rep_votes = sum(rep_votes),
-    dem_votes_minority = sum(dem_votes_minority),
-    dem_votes_majority = sum(dem_votes_majority),
-    per_minority = n_minority_voters / population,
-    maj_min_district = per_minority > 0.5,
-    dem_voteshare = dem_votes / population,
-    dem_district = dem_voteshare >= 0.5,
-    dem_voteshare_minority = dem_votes_minority / n_minority_voters,
-    dem_voteshare_majority = dem_votes_majority / n_majority_voters,
-    .groups = "drop"
-  ) %>% mutate(map_id = plan_id, district_id = as.integer(district_id)) %>%
-    mutate(across(c(dem_voteshare_minority, dem_voteshare_majority), ~ifelse(is.na(.), 0, .))) %>%
-    select(map_id, district_id, everything())
+  district_summary = df %>%
+    dplyr::group_by(district_id) %>%
+    dplyr::summarise(
+      n_precincts        = dplyr::n(),
+      population         = sum(population, na.rm = TRUE),
+      n_minority_voters  = sum(n_minority, na.rm = TRUE),
+      n_majority_voters  = sum(n_majority, na.rm = TRUE),
+      dem_votes          = sum(dem_votes, na.rm = TRUE),
+      rep_votes          = sum(rep_votes, na.rm = TRUE),
+      dem_votes_minority = sum(dem_votes_minority, na.rm = TRUE),
+      dem_votes_majority = sum(dem_votes_majority, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      per_minority           = safe_div(n_minority_voters, population),
+      maj_min_district       = per_minority > 0.5,
+      dem_voteshare          = safe_div(dem_votes, population),
+      dem_district           = dem_voteshare >= 0.5,
+      dem_voteshare_minority = safe_div(dem_votes_minority, n_minority_voters),
+      dem_voteshare_majority = safe_div(dem_votes_majority, n_majority_voters),
+      map_id                 = plan_id,
+      district_id            = as.integer(district_id)
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(
+        c(dem_voteshare_minority, dem_voteshare_majority),
+        ~ ifelse(is.na(.), 0, .)
+      )
+    ) %>%
+    dplyr::select(map_id, district_id, dplyr::everything())
   
   district_summary
 }
@@ -780,7 +811,7 @@ save_plan_summaries = function(map_data, plan_data, plan_type, output_dir) {
   has_init = "init_CD" %in% names(plan_data)
   stopifnot("precinct_id" %in% names(plan_data))
   plan_precinct_id = plan_data$precinct_id
-  plan_columns = setdiff(names(plan_data), c("precinct_id", "init_CD"))  # plan columns only
+  plan_columns = grep("^(step_\\d+|.*_map_\\d+)$", names(plan_data), value = TRUE) # plan columns only
   n_plans = length(plan_columns)
   
   cat("\nProcessing", n_plans, plan_type, if (plan_type=="neutral") "plans" else "ensemble plans", "\n")
@@ -1532,6 +1563,44 @@ plot_district_winners = function(map_data, title) {
          subtitle = paste0("D: ", dem_seats, " seats, R: ", rep_seats, " seats"))
 }
 
+# Build clean district boundary lines from a precinct map + district id
+district_lines = function(map_data, id = "district_id",
+                           simplify_keep = 0.05,
+                           min_len_m = 50) {
+  stopifnot(id %in% names(map_data))
+  
+  old_s2 = sf::sf_use_s2()
+  on.exit(sf::sf_use_s2(old_s2), add = TRUE)
+  sf::sf_use_s2(FALSE)
+  
+  # Dissolve to districts
+  dpoly = map_data %>%
+    dplyr::select(!!rlang::sym(id)) %>%
+    dplyr::group_by(!!rlang::sym(id)) %>%
+    dplyr::summarise(.groups = "drop") %>%
+    sf::st_make_valid()
+  
+  # Optional slight simplify for speed (topology-preserving)
+  if (!is.null(simplify_keep) && is.finite(simplify_keep) && simplify_keep > 0) {
+    dpoly = rmapshaper::ms_simplify(dpoly, keep = simplify_keep, keep_shapes = TRUE)
+  }
+  
+  # Boundaries → merged lines → extract LINESTRING parts
+  lines = dpoly %>%
+    sf::st_boundary() %>%
+    sf::st_line_merge()
+  
+  lines = sf::st_collection_extract(lines, "LINESTRING", warn = FALSE)
+  
+  if (!is.null(min_len_m) && is.finite(min_len_m) && min_len_m > 0) {
+    keep = as.numeric(sf::st_length(lines)) >= min_len_m
+    lines = lines[keep, , drop = FALSE]
+  }
+  
+  lines
+}
+
+
 # Show precinct-level data with district boundaries overlaid
 plot_precincts_with_districts = function(map_data, CD_plans, map_ids, category_name, output_dir) {
   # This is the 3-panel view: minority %, dem voteshare, district winners
@@ -1551,11 +1620,6 @@ plot_precincts_with_districts = function(map_data, CD_plans, map_ids, category_n
   # Calculate district-level statistics for the seat winner plot
   cd_summary = map_data %>% 
     st_drop_geometry() %>%
-    # mutate(
-    #   dem_vote_count = dem_voteshare * population,
-    #   minority_voter_count = per_minority * population,
-    #   majority_voter_count = population - minority_voter_count
-    # ) %>% 
     group_by(district_id) %>%
     summarise(
       n_precincts = n(),
@@ -1576,55 +1640,49 @@ plot_precincts_with_districts = function(map_data, CD_plans, map_ids, category_n
       suffix = c("", "_district")
     )
   
-  # Create district boundaries by aggregating precinct polygons
-  cd_borders = map_data %>%
-    group_by(district_id) %>%
-    summarise(geometry = st_union(geometry)) %>%
-    ungroup()
+  cd_borders_old = map_data %>%
+    dplyr::group_by(district_id) %>%
+    dplyr::summarise(geometry = sf::st_union(geometry), .groups="drop")
+  table(sf::st_geometry_type(cd_borders_old))
   
-  # Plot 1: District-level seat winners (red/blue)
+  cd_lines = district_lines(map_data, id = "district_id",
+                            simplify_keep = 0.05,   # small simplification is ok
+                            min_len_m = 50)
+  
+  # 1) seat winners (no precinct outlines)
   p1 = ggplot(plot_df) +
-    geom_sf(aes(fill = as.factor(dem_cd), color = as.factor(dem_cd)), alpha = 0.75) +
-    geom_sf(data = cd_borders, fill = NA, color = "darkred", linewidth = 0.8) +
-    scale_fill_manual(values = c('1' = 'blue', '0' = 'red'),
-                      labels = c('1' = 'D', '0' = 'R'),
-                      name = '') +
-    scale_color_manual(values = c('1' = 'blue', '0' = 'red'),
-                       labels = c('1' = 'D', '0' = 'R'),
-                       name = '') +
-    theme_void() +
-    guides(fill = 'none', color = 'none')
+    geom_sf(aes(fill = factor(dem_cd)), colour = NA, alpha = 0.9) +
+    geom_sf(data = cd_lines, color = "darkred", linewidth = 0.8,
+            lineend = "round", linejoin = "round", fill = NA) +
+    scale_fill_manual(values = c(`1` = "blue", `0` = "red"),
+                      labels = c(`1` = "D", `0` = "R"), name = "") +
+    theme_void() + guides(fill = "none")
   
-  # Plot 2: Democratic vote share at precinct level with district boundaries
+  # 2) precinct dem share + borders
   p2 = ggplot() +
-    geom_sf(data = map_data, aes(fill = dem_voteshare), color = NA) +
-    geom_sf(data = cd_borders, fill = NA, color = "darkred", linewidth = 0.8) +
+    geom_sf(data = map_data, aes(fill = dem_voteshare), colour = NA) +
+    geom_sf(data = cd_lines, color = "darkred", linewidth = 0.8,
+            lineend = "round", linejoin = "round", fill = NA) +
     scale_fill_gradient2(low = "#D32F2F", mid = "#F5F5F5", high = "#1976D2",
-                         midpoint = 0.5,
-                         labels = scales::percent,
-                         name = "Dem %") +
-    theme_void() +
-    guides(fill = 'none', color = 'none')
+                         midpoint = 0.5, labels = scales::percent, name = "Dem %") +
+    theme_void() + guides(fill = "none")
   
-  # Plot 3: Minority population at precinct level with district boundaries
+  # 3) precinct % minority + borders
   p3 = ggplot() +
-    geom_sf(data = map_data, aes(fill = per_minority), color = NA) +
-    geom_sf(data = cd_borders, fill = NA, color = "darkred", linewidth = 0.8) +
+    geom_sf(data = map_data, aes(fill = per_minority), colour = NA) +
+    geom_sf(data = cd_lines, color = "darkred", linewidth = 0.8,
+            lineend = "round", linejoin = "round", fill = NA) +
     scale_fill_gradient(low = "lightgrey", high = "black",
-                        labels = scales::percent,
-                        name = "% Min") +
-    theme_void() +
-    guides(fill = 'none', color = 'none')
+                        labels = scales::percent, name = "% Min") +
+    theme_void() + guides(fill = "none")
   
-  # Combine all three plots in a row
-  comb_plot = p3 + p2 + p1 + plot_layout(nrow = 1, ncol = 3)
+  comb_plot = p3 + p2 + p1 + patchwork::plot_layout(nrow = 1, ncol = 3)
   
-  # Save the plot with a sanitized filename
   sanitized_category = gsub("[%]", "pct", gsub("[ ]", "_", tolower(category_name)))
-  plot_filename = paste0(output_dir, sanitized_category, '_precinct_district_map.pdf')
+  plot_filename = file.path(output_dir, paste0(sanitized_category, "_precinct_district_map.pdf"))
   ggsave(plot_filename, comb_plot, width = 18, height = 6, dpi = 300)
   
-  return(comb_plot)
+  comb_plot
 }
 
 # 3. ENSEMBLE/DISTRIBUTION VISUALIZATIONS
@@ -2729,7 +2787,7 @@ prepare_tx_for_redistricting = function(
     out_shapefile,
     # EI hyperparameters (probability scale, truncated to [0,1])
     ei_means = c(white = 0.35, black = 0.90, hisp = 0.65),
-    ei_sds   = c(white = 0.3, black = 0.10, hisp = 0.12),
+    ei_sds   = c(white = 0.3,  black = 0.10, hisp = 0.12),
     ei_corr  = list(rho_wb = 0.5, rho_wh = 0.5, rho_bh = 0.5, R = NULL),
     # Randomness
     seed = 123,
@@ -2739,15 +2797,16 @@ prepare_tx_for_redistricting = function(
   set.seed(seed)
   
   stopifnot(file.exists(in_shapefile))
-  sf0 = sf::read_sf(in_shapefile) %>%
-    sf::st_make_valid()
+  sf0 = sf::read_sf(in_shapefile) %>% sf::st_make_valid()
   
   # Required columns present?
   need = c("prec_id","dem_votes","rep_votes","cvap_wht","cvap_blk","cvap_hsp")
   missing = setdiff(need, names(sf0))
   if (length(missing)) stop("Missing required columns: ", paste(missing, collapse = ", "))
   
-  # Keep only precincts with observed votes and some CVAP
+  # ------------------------------------------------------------------
+  # NEW: KEEP *ALL* PRECINCTS (no filtering). Zeros stay in the table.
+  # ------------------------------------------------------------------
   sf1 = sf0 %>%
     mutate(
       V_total = as.integer(dem_votes + rep_votes),
@@ -2755,57 +2814,70 @@ prepare_tx_for_redistricting = function(
       N_black = pmax(0L, as.integer(round(cvap_blk))),
       N_hisp  = pmax(0L, as.integer(round(cvap_hsp))),
       N_tot   = N_white + N_black + N_hisp
-    ) %>%
-    filter(V_total > 0, N_tot > 0)
+    )
   
-  if (nrow(sf1) == 0L) stop("No usable precincts after filtering (need positive votes and CVAP).")
+  n = nrow(sf1)
   
-  # Assign votes to groups proportional to CVAP
-  V = sf1$V_total
+  # ------------------------------
+  # Votes → groups (robust weights)
+  # ------------------------------
   W = sf1$N_white; B = sf1$N_black; H = sf1$N_hisp
-  wts = cbind(W, B, H) / pmax(1L, (W + B + H))
-  vg_mat = matrix(0L, nrow = nrow(sf1), ncol = 3)
-  for (i in seq_len(nrow(sf1))) {
-    vg_mat[i,] = int_alloc_by_weights(V[i], wts[i,])
-  }
+  sum_cvap = W + B + H
+  
+  # base weights (avoid divide-by-zero)
+  wts = cbind(W, B, H) / pmax(1L, sum_cvap)
+  
+  # if CVAP is all zero but turnout > 0, fall back to equal split
+  ix_zero_cvap_and_votes = which(sum_cvap == 0 & sf1$V_total > 0)
+  if (length(ix_zero_cvap_and_votes)) wts[ix_zero_cvap_and_votes, ] = 1/3
+  
+  # integer allocation of total votes to groups (works with V_total = 0 too)
+  vg_mat = matrix(0L, nrow = n, ncol = 3)
+  for (i in seq_len(n)) vg_mat[i, ] = int_alloc_by_weights(sf1$V_total[i], wts[i, ])
   colnames(vg_mat) = c("v_white","v_black","v_hisp")
   
-  # EI draws: one 3-vector (p_white, p_black, p_hisp) per precinct from TMVN[0,1]^3
+  # ---------------------------------------
+  # EI draws ONLY where V_total > 0 (ix_V)
+  # ---------------------------------------
   means = as.numeric(ei_means[c("white","black","hisp")])
   sds   = as.numeric(ei_sds[c("white","black","hisp")])
   R     = build_corr(ei_corr$rho_wb, ei_corr$rho_wh, ei_corr$rho_bh, ei_corr$R)
   Sigma = diag(sds) %*% R %*% diag(sds)
   
-  P = tmvtnorm::rtmvnorm(
-    n = nrow(sf1),
-    mean = means,
-    sigma = Sigma,
-    lower = rep(0, 3),
-    upper = rep(1, 3)
-  )
+  ix_V = which(sf1$V_total > 0)
+  
+  P = matrix(0, nrow = n, ncol = 3)
+  if (length(ix_V)) {
+    P[ix_V, ] = tmvtnorm::rtmvnorm(
+      n = length(ix_V),
+      mean = means, sigma = Sigma,
+      lower = rep(0, 3), upper = rep(1, 3)
+    )
+  }
   colnames(P) = c("p_white","p_black","p_hisp")
   
-  # Individual-level group votes via Binomial; then minimal integer adjustment to hit precinct dem totals exactly
+  # Binomial draws (zeros outside ix_V)
   v_white = vg_mat[, 1]; v_black = vg_mat[, 2]; v_hisp = vg_mat[, 3]
   p_white = P[, 1];      p_black = P[, 2];      p_hisp = P[, 3]
   
-  D_white = rbinom(nrow(sf1), size = v_white, prob = p_white)
-  D_black = rbinom(nrow(sf1), size = v_black, prob = p_black)
-  D_hisp  = rbinom(nrow(sf1), size = v_hisp,  prob = p_hisp)
+  D_white = integer(n); D_black = integer(n); D_hisp = integer(n)
+  if (length(ix_V)) {
+    D_white[ix_V] = rbinom(length(ix_V), size = v_white[ix_V], prob = p_white[ix_V])
+    D_black[ix_V] = rbinom(length(ix_V), size = v_black[ix_V], prob = p_black[ix_V])
+    D_hisp[ix_V]  = rbinom(length(ix_V), size = v_hisp[ix_V],  prob = p_hisp[ix_V])
+  }
   
-  # Adjust to match observed precinct Democratic totals exactly
+  # Adjust ONLY where V_total > 0 to match observed precinct D totals exactly
   dem_obs = as.integer(sf1$dem_votes)
-  for (i in seq_len(nrow(sf1))) {
+  for (i in ix_V) {
     Dg = c(D_white[i], D_black[i], D_hisp[i])
     vg = c(v_white[i], v_black[i], v_hisp[i])
     Dg2 = adjust_group_D_to_match(Dg, vg, dem_obs[i])
     D_white[i] = Dg2[1]; D_black[i] = Dg2[2]; D_hisp[i] = Dg2[3]
   }
   
-  # Build outputs (collapse to majority/minority for downstream)
+  # Derived counters
   rep_obs = as.integer(sf1$rep_votes)
-  V_check = D_white + D_black + D_hisp + (rep_obs) # not used—just sanity
-  # Group reps derived from v_g - D_g to keep totals exact
   R_white = v_white - D_white
   R_black = v_black - D_black
   R_hisp  = v_hisp  - D_hisp
@@ -2818,14 +2890,13 @@ prepare_tx_for_redistricting = function(
   rep_min = n_min - dem_min
   rep_maj = n_maj - dem_maj
   
-  pop_turnout = as.integer(dem_obs + rep_obs)  # population used by seat calc = observed turnout
+  pop_turnout = as.integer(dem_obs + rep_obs)
   
-  # Shares (guard zero-denominators)
-  safe_div = function(a, b) ifelse(b > 0, a/b, 0)
+  safe_div = function(a, b) ifelse(b > 0, a / b, 0)
   
   out = sf1 %>%
     mutate(
-      pct_id    = seq_len(nrow(sf1)),
+      pct_id    = seq_len(n),
       orig_id   = prec_id,
       pop       = pop_turnout,
       n_min     = n_min,
@@ -2838,25 +2909,14 @@ prepare_tx_for_redistricting = function(
       rep_v_maj = rep_maj,
       pct_min   = safe_div(n_min, pmax(1L, pop_turnout)),
       dem_vsh   = safe_div(dem_obs, pmax(1L, pop_turnout)),
-      dem_vsh_1 = safe_div(dem_min, pmax(1L, n_min)),  # minority D share
-      dem_vsh_0 = safe_div(dem_maj, pmax(1L, n_maj))   # majority D share
+      dem_vsh_1 = safe_div(dem_min, pmax(1L, n_min)),
+      dem_vsh_0 = safe_div(dem_maj, pmax(1L, n_maj))
     ) %>%
-    # Keep only the columns your pipeline expects + geometry
     select(pct_id, orig_id, pop, n_min, n_maj,
            dem_v, rep_v, dem_v_min, rep_v_min, dem_v_maj, rep_v_maj,
            pct_min, dem_vsh, dem_vsh_1, dem_vsh_0, geometry)
   
-
-  
-  # --- CRS + topology cleaning (projected, snapped, valid) ---
-  # if (is.na(sf::st_crs(out))) sf::st_crs(out) = 4326
-  # out = sf::st_transform(out, 3083)   # Texas Centric Albers (meters)
-  # out = sf::st_set_precision(out, 1000)  # 1 m grid
-  # out = sf::st_make_valid(out)
-  # out = lwgeom::st_snap_to_grid(out, 1000)
-  # out = sf::st_buffer(out, 0)
-  
-  # Optional simplify in meters (keep small to preserve topology)
+  # Optional: tiny simplify already happens upstream; keep off by default
   if (!is.na(simplify_tolerance) && is.finite(simplify_tolerance) && simplify_tolerance > 0) {
     out = sf::st_simplify(out, dTolerance = simplify_tolerance, preserveTopology = TRUE)
     out = sf::st_make_valid(out)
@@ -2865,7 +2925,7 @@ prepare_tx_for_redistricting = function(
   dir.create(dirname(out_shapefile), recursive = TRUE, showWarnings = FALSE)
   sf::st_write(out, out_shapefile, append = FALSE, quiet = TRUE)
   
-  # Quick integrity checks
+  # Integrity checks
   stopifnot(sum(out$dem_v + out$rep_v) == sum(pop_turnout))
   stopifnot(all(out$dem_v == out$dem_v_min + out$dem_v_maj))
   stopifnot(all(out$rep_v == out$rep_v_min + out$rep_v_maj))
@@ -2873,6 +2933,7 @@ prepare_tx_for_redistricting = function(
   message("Wrote shapefile with EI-imposed group votes: ", out_shapefile)
   invisible(out)
 }
+
 
 
 
