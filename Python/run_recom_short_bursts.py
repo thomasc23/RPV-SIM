@@ -22,26 +22,25 @@ import matplotlib.pyplot as plt
 
 
 def _normalize_gdf_for_chain(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Ensure expected names/dtypes: pct_id, population, dem_v, rep_v."""
+    """Ensure expected names/dtypes: precinct_id, population, dem_v, rep_v."""
     gdf = gdf.reset_index(drop=True).copy()
 
     rename_map = {}
-    if "precinct_id" in gdf.columns and "pct_id" not in gdf.columns:
-        rename_map["precinct_id"] = "pct_id"
+    if "pct_id" in gdf.columns and "precinct_id" not in gdf.columns:
+        rename_map["pct_id"] = "precinct_id"
     if "pop" in gdf.columns and "population" not in gdf.columns:
         rename_map["pop"] = "population"
-    # Keep dem_v/rep_v as-is; many pipelines already use these names.
     gdf = gdf.rename(columns=rename_map)
 
-    required = {"pct_id", "population", "dem_v", "rep_v"}
+    required = {"precinct_id", "population", "dem_v", "rep_v"}
     missing = [c for c in required if c not in gdf.columns]
     if missing:
         raise ValueError(f"Shapefile missing required columns: {missing}")
 
-    gdf["pct_id"] = gdf["pct_id"].astype(int)
-    gdf["population"]    = gdf["population"].fillna(0).astype(int)
-    gdf["dem_v"]  = gdf["dem_v"].fillna(0).astype(int)
-    gdf["rep_v"]  = gdf["rep_v"].fillna(0).astype(int)
+    gdf["precinct_id"] = gdf["precinct_id"].astype(int)
+    gdf["population"]  = gdf["population"].fillna(0).astype(int)
+    gdf["dem_v"]       = gdf["dem_v"].fillna(0).astype(int)
+    gdf["rep_v"]       = gdf["rep_v"].fillna(0).astype(int)
 
     # shares can exist for other analytics; not used for seats
     for c in ("dem_voteshare", "rep_voteshare"):
@@ -84,48 +83,7 @@ def run_redistricting_analysis(
     # Load shapefile
     print(f"Loading shapefile from {shapefile_path}")
     gdf = gpd.read_file(shapefile_path)
-    
-    # Check for required columns
-    required_columns = ["pct_id", "pop", "dem_v", "rep_v"]
-    missing_columns = [col for col in required_columns if col not in gdf.columns]
-    
-    if missing_columns:
-        error_msg = f"Error: The following required columns are missing: {', '.join(missing_columns)}"
-        print(error_msg)
-        raise ValueError(error_msg)
-    
-    # Ensure the GeoDataFrame has a unique index
-    gdf = gdf.reset_index(drop=True)
-    
-    # Rename variables to standard names used in the script
-    column_mapping = {
-        "pct_id": "precinct_id", 
-        "pop": "population", 
-        "dem_v": "dem_votes",
-        "rep_v": "rep_votes"
-    }
-    
-    gdf = gdf.rename(columns=column_mapping)
-    
-    # ---- Ensure vote COUNTS exist and are ints ----
-    if "dem_v" not in gdf.columns or "rep_v" not in gdf.columns:
-        raise ValueError("Expected vote count columns 'dem_v' and 'rep_v' in the shapefile.")
-    gdf["dem_v"] = gdf["dem_v"].fillna(0).astype(int)
-    gdf["rep_v"] = gdf["rep_v"].fillna(0).astype(int)
-    
-    # keep shares for other uses, but they are NOT used for seats
-    if "dem_voteshare" in gdf.columns:
-        gdf["dem_voteshare"] = gdf["dem_voteshare"].fillna(0.0).astype(float)
-    if "rep_voteshare" in gdf.columns:
-        gdf["rep_voteshare"] = gdf["rep_voteshare"].fillna(0.0).astype(float)
-    
-    # Calculate additional columns if needed
-    if "per_minority" in gdf.columns and "population" in gdf.columns:
-        gdf['bvap'] = np.round(gdf['per_minority'] * gdf['population']).astype(int)
-        gdf['wvap'] = gdf['population'] - gdf['bvap']
-    
-    if "dem_voteshare" in gdf.columns:
-        gdf['rep_voteshare'] = 1 - gdf['dem_voteshare']
+    gdf = _normalize_gdf_for_chain(gdf)
     
     # Create graph from GeoDataFrame
     print("Creating graph from GeoDataFrame")
@@ -227,8 +185,8 @@ def run_redistricting_analysis(
                 "cut_edges": len(partition["cut_edges"]),
                 "efficiency_gap": efficiency_gap(partition["E0"]),
                 "mean_median": mean_median(partition["E0"]),
-                "dem_seats": partition["E0"].wins("Dem"),
-                "rep_seats": partition["E0"].wins("Rep")
+                "dem_seats": partition["E0"].wins("D"),
+                "rep_seats": partition["E0"].wins("R")
             })
             
             CD_assignments.append({
@@ -394,22 +352,7 @@ def create_biased_ensemble(
 
     # -------- Load shapefile & normalize columns --------
     gdf = gpd.read_file(shapefile_path)
-    if simplify_tolerance is not None:
-        try:
-            gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
-        except Exception:
-            pass
-
-    rename_map = {}
-    if "pct_id" in gdf.columns and "precinct_id" not in gdf.columns:
-        rename_map["pct_id"] = "precinct_id"
-    if "pop" in gdf.columns and "population" not in gdf.columns:
-        rename_map["pop"] = "population"
-    gdf = gdf.rename(columns=rename_map)
-
-    required = {"precinct_id", "population", "dem_v", "rep_v"}
-    missing = [c for c in required if c not in gdf.columns]
-    assert not missing, f"Shapefile missing required columns: {missing}"
+    gdf = _normalize_gdf_for_chain(gdf)
 
     # -------- Build graph --------
     graph = Graph.from_geodataframe(

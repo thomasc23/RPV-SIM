@@ -22,19 +22,19 @@ source('R/auxiliary.R')
 # ---------- Run TX maps (neutral, R, D) ----------
 draw_tx_maps = function() {
   
-  N_PLANS          = 1000
-  ENSEMBLE_SIZE    = 10
+  N_PLANS          = 100
+  ENSEMBLE_SIZE    = 2
   BURST_LENGTH     = 10
   NUM_BURSTS       = 10
   PATIENCE_BURSTS  = 5
   SOFT_K           = 60
   SIMPLIFY_TOL     = NA
   RANDOM_SEED      = 123
-  OUTPUT_BASE_DIR  = 'Output/TEXAS2/'
+  OUTPUT_BASE_DIR  = 'Output/TEXAS3/'
   DEV_MODE         = TRUE
   
   # Paths
-  SHAPEFILE_IN        = "data/States/TX/out/tx_24.shp"
+  SHAPEFILE_IN        = "data/States/TX/out/cdp_tx_24.shp"
   SHAPEFILE_FOR_PIPE  = file.path(OUTPUT_BASE_DIR, "state_map.shp")
   OUTPUT_DIR          = OUTPUT_BASE_DIR
   

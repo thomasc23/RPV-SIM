@@ -64,6 +64,35 @@ def _read_json(path: Path, default):
         return default
 
 
+def _normalize_gdf_for_chain(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Ensure expected names/dtypes: precinct_id, population, dem_v, rep_v."""
+    gdf = gdf.reset_index(drop=True).copy()
+
+    rename_map = {}
+    if "pct_id" in gdf.columns and "precinct_id" not in gdf.columns:
+        rename_map["pct_id"] = "precinct_id"
+    if "pop" in gdf.columns and "population" not in gdf.columns:
+        rename_map["pop"] = "population"
+    gdf = gdf.rename(columns=rename_map)
+
+    required = {"precinct_id", "population", "dem_v", "rep_v"}
+    missing = [c for c in required if c not in gdf.columns]
+    if missing:
+        raise ValueError(f"Shapefile missing required columns: {missing}")
+
+    gdf["precinct_id"] = gdf["precinct_id"].astype(int)
+    gdf["population"]  = gdf["population"].fillna(0).astype(int)
+    gdf["dem_v"]       = gdf["dem_v"].fillna(0).astype(int)
+    gdf["rep_v"]       = gdf["rep_v"].fillna(0).astype(int)
+
+    # shares can exist for other analytics; not used for seats
+    for c in ("dem_voteshare", "rep_voteshare"):
+        if c in gdf.columns:
+            gdf[c] = gdf[c].astype(float)
+
+    return gdf
+
+
 # ===================== Redistricting Functions ===============
 
 def run_redistricting_analysis(
@@ -111,47 +140,20 @@ def run_redistricting_analysis(
     # Load shapefile
     print(f"Loading shapefile from {shapefile_path}")
     gdf = gpd.read_file(shapefile_path)
-    
-    # Check for required columns
-    required_columns = ["pct_id", "pop", "pct_min", "dem_vsh"]
-    missing_columns = [col for col in required_columns if col not in gdf.columns]
-    
-    if missing_columns:
-        error_msg = f"Error: The following required columns are missing: {', '.join(missing_columns)}"
-        print(error_msg)
-        raise ValueError(error_msg)
-    
-    # Ensure the GeoDataFrame has a unique index
-    gdf = gdf.reset_index(drop=True)
-    
-    # Rename variables to standard names used in the script
-    column_mapping = {
-        "pct_id": "precinct_id", 
-        "pop": "population", 
-        "pct_min": "per_minority", 
-        "dem_vsh": "dem_voteshare"
-    }
-    
-    gdf = gdf.rename(columns=column_mapping)
-    
-    # Calculate additional columns if needed
-    if "per_minority" in gdf.columns and "population" in gdf.columns:
-        gdf['bvap'] = np.round(gdf['per_minority'] * gdf['population']).astype(int)
-        gdf['wvap'] = gdf['population'] - gdf['bvap']
-    
-    if "dem_voteshare" in gdf.columns:
-        gdf['rep_voteshare'] = 1 - gdf['dem_voteshare']
+    gdf = _normalize_gdf_for_chain(gdf)
     
     # Create graph from GeoDataFrame
     print("Creating graph from GeoDataFrame")
-    graph = Graph.from_geodataframe(gdf)
+    graph = Graph.from_geodataframe(
+      gdf,
+      adjacency = 'rook',
+      ignore_errors = True
+      )
     
-    # Add population data to graph
     for node in graph.nodes():
-        graph.nodes[node]["population"] = gdf.loc[node, "population"]
-        if "dem_voteshare" in gdf.columns:
-            graph.nodes[node]['dem_voteshare'] = gdf.loc[node, 'dem_voteshare']
-            graph.nodes[node]['rep_voteshare'] = gdf.loc[node, 'rep_voteshare']
+      graph.nodes[node]["population"] = int(gdf.loc[node, "population"])
+      graph.nodes[node]["dem_v"]      = int(gdf.loc[node, "dem_v"])
+      graph.nodes[node]["rep_v"]      = int(gdf.loc[node, "rep_v"])
     
     # Calculate total population
     total_population = sum(gdf['population'])
@@ -171,13 +173,12 @@ def run_redistricting_analysis(
     print(f"Ideal population per district: {ideal_population}")
     
     # Set up Election
-    election = Election("ELECTION", {"Dem": "dem_voteshare", "Rep": 'rep_voteshare'})
-    
-    # Set up updaters
+    election = Election("E0", {"D": "dem_v", "R": "rep_v"})
+
     my_updaters = {
-        'population': Tally('population'),
-        'cut_edges': cut_edges,
-        'ELECTION': election
+        "population": Tally("population"),
+        "cut_edges": cut_edges,
+        "E0": election
     }
     
     # Create initial partition
@@ -257,10 +258,10 @@ def run_redistricting_analysis(
             metrics.append({
                 "step": i,
                 "cut_edges": len(partition["cut_edges"]),
-                "efficiency_gap": efficiency_gap(partition["ELECTION"]),
-                "mean_median": mean_median(partition["ELECTION"]),
-                "dem_seats": partition["ELECTION"].wins("Dem"),
-                "rep_seats": partition["ELECTION"].wins("Rep")
+                "efficiency_gap": efficiency_gap(partition["E0"]),
+                "mean_median": mean_median(partition["E0"]),
+                "dem_seats": partition["E0"].wins("D"),
+                "rep_seats": partition["E0"].wins("R")
             })
             
             CD_assignments.append({
@@ -274,10 +275,10 @@ def run_redistricting_analysis(
                 metric_rows.append({
                     "step": i,
                     "cut_edges": len(partition["cut_edges"]),
-                    "efficiency_gap": efficiency_gap(partition["ELECTION"]),
-                    "mean_median": mean_median(partition["ELECTION"]),
-                    "dem_seats": partition["ELECTION"].wins("Dem"),
-                    "rep_seats": partition["ELECTION"].wins("Rep")
+                    "efficiency_gap": efficiency_gap(partition["E0"]),
+                "mean_median": mean_median(partition["E0"]),
+                "dem_seats": partition["E0"].wins("D"),
+                "rep_seats": partition["E0"].wins("R")
                 })
                 # long format: 1 row per precinct assignment
                 assign = partition.assignment
@@ -386,9 +387,26 @@ def save_neutral_results(metrics, CD_assignments, gdf, output_dir):
         for i, row in enumerate(df_assignments['district_id']):
             all_assignments[:, i] = row
         
-        df_pivoted = pd.DataFrame(all_assignments, columns=[f'step_{i+1}' for i in range(num_steps_completed)])
-        df_pivoted['precinct_id'] = gdf['precinct_id']
-        df_pivoted['init_CD'] = gdf['init_CD']
+        df_pivoted = pd.DataFrame(
+          all_assignments,
+          columns=[f"step_{i+1}" for i in range(num_steps_completed)]
+          )
+        
+        df_pivoted["precinct_id"] = gdf["precinct_id"].astype(int)
+
+        # NEW: carry through vendor id if present
+        if "orig_id" in gdf.columns:
+            df_pivoted["orig_id"] = gdf["orig_id"].astype(str)
+        else:
+            # fallback: mirror precinct_id as string
+            df_pivoted["orig_id"] = gdf["precinct_id"].astype(str)
+        
+        df_pivoted["init_CD"] = gdf["init_CD"].astype(int)
+        
+        # reorder for convenience
+        first_cols = ["precinct_id", "orig_id", "init_CD"]
+        step_cols  = [c for c in df_pivoted.columns if c.startswith("step_")]
+        df_pivoted = df_pivoted[first_cols + step_cols]
         
         plan_output_path = os.path.join(output_dir, "CD_plans.csv")
         df_pivoted.to_csv(plan_output_path, index=False)
@@ -450,27 +468,16 @@ def create_biased_ensemble(
         return None, None
     
 
-    # -------- Load shapefile & normalize columns --------
+   # -------- Load shapefile & normalize columns --------
     gdf = gpd.read_file(shapefile_path)
-    if simplify_tolerance is not None:
-        try:
-            gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
-        except Exception:
-            pass
-
-    rename_map = {}
-    if "pct_id" in gdf.columns and "precinct_id" not in gdf.columns:
-        rename_map["pct_id"] = "precinct_id"
-    if "pop" in gdf.columns and "population" not in gdf.columns:
-        rename_map["pop"] = "population"
-    gdf = gdf.rename(columns=rename_map)
-
-    required = {"precinct_id", "population", "dem_v", "rep_v"}
-    missing = [c for c in required if c not in gdf.columns]
-    assert not missing, f"Shapefile missing required columns: {missing}"
+    gdf = _normalize_gdf_for_chain(gdf)
 
     # -------- Build graph --------
-    graph = Graph.from_geodataframe(gdf)
+    graph = Graph.from_geodataframe(
+      gdf,
+      adjacency = 'rook',
+      ignore_errors = True
+      )
     for node in graph.nodes():
         graph.nodes[node]["population"] = int(gdf.iloc[node]["population"])
         graph.nodes[node]["dem_v"]      = int(gdf.iloc[node]["dem_v"])

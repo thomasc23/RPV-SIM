@@ -26,7 +26,7 @@ const normVotes = votesAbs.replace(/\\/g, "/");
 const m = normVotes.match(/\/States\/([A-Z]{2})\//);
 const stateCode = (m ? m[1] : "XX").toLowerCase();
 
-// Vote year → field names
+// Vote year -> field names
 function detectVoteYY(p) {
   const y4 = (p.match(/20(16|20|24)/) || [])[0];
   if (y4) return y4.slice(-2);
@@ -43,7 +43,13 @@ const demField = DEM_FIELDS[voteYY] || DEM_FIELDS["16"];
 const cvapBase  = path.basename(cvapAbs, ".shp");
 const cvapYear4 = (cvapBase.match(/(\d{4})/) || [])[1] || "2020";
 const cvapYY    = cvapYear4.slice(-2);
-const cvapFields = [`CVAP_TOT${cvapYY}`, `CVAP_WHT${cvapYY}`, `CVAP_BLK${cvapYY}`, `CVAP_HSP${cvapYY}`];
+
+// Need: total, non-Hispanic total, Hispanic, and NH race-alone categories
+const cvapFields = [
+  `CVAP_TOT${cvapYY}`, `CVAP_NHS${cvapYY}`, `CVAP_HSP${cvapYY}`,
+  `CVAP_AMI${cvapYY}`, `CVAP_ASI${cvapYY}`, `CVAP_BLA${cvapYY}`,
+  `CVAP_NHP${cvapYY}`, `CVAP_2OM${cvapYY}`
+];
 
 // Output path (.shp)
 const outDir  = path.join(dataRoot, "States", stateCode.toUpperCase(), "out");
@@ -59,10 +65,15 @@ const cbgLayer      = "cbg";
 const renameList = [
   `rep_votes=${repField}`,
   `dem_votes=${demField}`,
+  // raw CVAP interpolates (kept for auditing)
   `cvap_tot=CVAP_TOT${cvapYY}`,
-  `cvap_wht=CVAP_WHT${cvapYY}`,
-  `cvap_blk=CVAP_BLK${cvapYY}`,
-  `cvap_hsp=CVAP_HSP${cvapYY}`
+  `cvap_nhs=CVAP_NHS${cvapYY}`,
+  `cvap_hsp=CVAP_HSP${cvapYY}`,
+  `cvap_ami=CVAP_AMI${cvapYY}`,
+  `cvap_asi=CVAP_ASI${cvapYY}`,
+  `cvap_bla=CVAP_BLA${cvapYY}`,
+  `cvap_nhp=CVAP_NHP${cvapYY}`,
+  `cvap_2om=CVAP_2OM${cvapYY}`
 ].join(",");
 
 // Standardize ID/label fields across vintages
@@ -80,45 +91,71 @@ const makeIdAndLabel = [
 
 // Round CVAP to integers
 const roundCvap = [
-  `cvap_tot = (cvap_tot==null?null:Math.round(cvap_tot));`,
-  `cvap_wht = (cvap_wht==null?null:Math.round(cvap_wht));`,
-  `cvap_blk = (cvap_blk==null?null:Math.round(cvap_blk));`,
-  `cvap_hsp = (cvap_hsp==null?null:Math.round(cvap_hsp));`
+  `cvap_tot = (cvap_tot==null?0:Math.max(0, Math.round(cvap_tot)));`,
+  `cvap_nhs = (cvap_nhs==null?0:Math.max(0, Math.round(cvap_nhs)));`,
+  `cvap_hsp = (cvap_hsp==null?0:Math.max(0, Math.round(cvap_hsp)));`,
+  `cvap_ami = (cvap_ami==null?0:Math.max(0, Math.round(cvap_ami)));`,
+  `cvap_asi = (cvap_asi==null?0:Math.max(0, Math.round(cvap_asi)));`,
+  `cvap_bla = (cvap_bla==null?0:Math.max(0, Math.round(cvap_bla)));`,
+  `cvap_nhp = (cvap_nhp==null?0:Math.max(0, Math.round(cvap_nhp)));`,
+  `cvap_2om = (cvap_2om==null?0:Math.max(0, Math.round(cvap_2om)));`
 ].join(" ");
 
+// Build mutually-exclusive W/B/H
+// - Non-Hispanic White alone = NH total minus NH non-white categories
+// - Non-Hispanic Black alone = cvap_bla
+// - Hispanic (any race)      = cvap_hsp
+const buildExclusive = [
+  `cvap_whtx = Math.max(0, cvap_nhs - (cvap_ami + cvap_asi + cvap_bla + cvap_nhp + cvap_2om));`,
+  `cvap_blkx = Math.max(0, cvap_bla);`,
+  `cvap_hspx = Math.max(0, cvap_hsp);`,
+  // diagnostic ratio: should be ≤ 1, small >1 can happen from rounding
+  `cvap_chk  = (cvap_tot>0 ? (cvap_whtx + cvap_blkx + cvap_hspx) / cvap_tot : 0);`
+].join(" ");
+
+// Final keep list (plus diagnostic)
 const keepFields = [
   "prec_id","prec_label","rep_votes","dem_votes",
-  "cvap_tot","cvap_wht","cvap_blk","cvap_hsp"
+  "cvap_tot","cvap_whtx","cvap_blkx","cvap_hspx","cvap_chk"
 ].join(",");
 
 // Snap/clean params in EPSG:3083 (meters)
 const SNAP = "snap-interval=5";    // tweak if needed (2–10 m typical)
 
-// Build command (array form avoids shell quoting issues)
+// Build command
 const args = [
-  // Import
   "-i", votesAbs, `name=${precinctLayer}`,
   "-i", cvapAbs,  `name=${cbgLayer}`,
+
   // Reproject to EPSG:3083 (Texas Albers)
   "-proj", "EPSG:3083", `target=${precinctLayer}`,
   "-proj", `match=${precinctLayer}`, `target=${cbgLayer}`,
-  // Pre-join snapping/cleaning (reduce overlaps & slivers)
+
+  // Pre-join snapping/cleaning
   "-clean", SNAP, `target=${precinctLayer}`,
   "-clean", SNAP, `target=${cbgLayer}`,
-  // Interpolate ONLY the CVAP counts (no attribute copies)
+
+  // Area-weighted interpolation of required CVAP fields
   "-join", `source=${cbgLayer}`, `target=${precinctLayer}`,
     `interpolate=${cvapFields.join(",")}`,
     "fields=", "min-overlap-area=1e-6",
-  // Post-join snap/clean (optional, helps fix tiny overlaps introduced by split)
+
+  // Post-join clean
   "-clean", SNAP, `target=${precinctLayer}`,
-  // Rename to Shapefile-safe names
+
+  // Rename to short names
   "-rename-fields", `target=${precinctLayer}`, renameList,
-  // Standardize id/label
+
+  // IDs
   "-each", `target=${precinctLayer}`, makeIdAndLabel,
-  // Round CVAP integers
+
+  // Round CVAPs, then build exclusive W/B/H and diagnostic
   "-each", `target=${precinctLayer}`, roundCvap,
+  "-each", `target=${precinctLayer}`, buildExclusive,
+
   // Keep tidy schema
   "-filter-fields", `target=${precinctLayer}`, keepFields,
+
   // Write Shapefile in EPSG:3083, quantized to 1 m grid
   "-o", "force", "format=shapefile", "precision=1",
         `target=${precinctLayer}`, outFileShp
@@ -132,6 +169,8 @@ console.log("voteYY:", voteYY, "repField:", repField, "demField:", demField, "cv
 try {
   execFileSync("mapshaper", args, { stdio: "inherit" });
   console.log(`\n✅ Wrote ${outFileShp}`);
+  console.log("   Fields: prec_id, dem_votes, rep_votes, cvap_tot, cvap_whtx (NH White), cvap_blkx (NH Black), cvap_hspx (Hispanic), cvap_chk");
+  console.log("   Tip: summarize cvap_chk in R; values should be ≤ 1 (± tiny rounding).");
 } catch (e) {
   console.error("\n❌ mapshaper failed.");
   process.exit(2);
