@@ -1,0 +1,46 @@
+# 1. Generating a population of voters
+
+```{r}
+df = create_population_data(
+    n_precincts = 2600,
+    seed = 1234
+)
+
+head(df)
+
+```
+
+
+# 2. Add baseline votes
+
+```{r}
+
+df = add_baseline_votes(
+    df
+)
+
+head(df)
+
+```
+
+
+# 3. Create Shapefile
+
+```{r}
+
+grid = create_realistic_grid(
+    n_precincts = nrow(df), 
+    n_centers = 5, 
+    bounds = c(0, 1000, 0, 1000), 
+    decay_rate = 15,
+    base_density = 0.10,
+    peak_multiplier = 10.00,
+    decay_power = 1.00,
+    center_radius = 10.00,
+    seed = 1234
+    )
+
+```
+
+
+# 4. Create Seg. Levels

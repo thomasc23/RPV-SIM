@@ -1,0 +1,11 @@
+# Export all functions (add roxygen2 documentation later)
+exportPattern("^[[:alpha:]]+")
+
+# Import required packages
+import(usethis)
+import(spdep)
+import(sf)
+import(dplyr)
+import(rlang)
+import(spatstat)
+import(spatstat.geom)
