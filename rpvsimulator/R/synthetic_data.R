@@ -218,6 +218,29 @@ create_realistic_grid = function(n_precincts     = 2600,
     precincts$dist_to_center[i] = min(distances)
     precincts$nearest_center[i] = which.min(distances)
   }
+
+  save_diagnostic_plot("sim_shapefile_figures", function() {
+    par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+    
+    # 1. City centers
+    plot(centers$x, centers$y, main = "City Centers", xlab = "", ylab = "", col = "black")
+    
+    # 2. Seed points via rejection sampling
+    plot(seeds$x, seeds$y, main = "Precinct Centroids", xlab = "", ylab = "", col = "black")
+
+    # 3. Precinct boundaries
+    plot(precincts$geometry, main = "Precinct Geographic Boundaries", xlab = "", ylab = "")
+    
+    par(mfrow = c(1, 1))
+  })
   
   return(list(precincts = precincts, centers = centers))
+}
+
+
+
+simulate_segregation_scenarios = function(
+  
+) {
+
 }
