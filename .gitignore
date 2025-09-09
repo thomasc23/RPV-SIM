@@ -17,6 +17,7 @@ __pycache__/
 *.tgz
 
 # Vignette builds
+docs/ # REMOVE WHEN PUBLISHING
 inst/doc
 vignettes/*.html
 vignettes/*.R
