@@ -12,30 +12,41 @@ __pycache__/
 # OS specific
 .DS_Store
 
-# Directories to ignore
-ARCHIVE/
-Neutral Redistricting/
-Output/
-Scripts/
-Simulated Shapefiles/
-Simulating Plans/
-Workflow/
-data/*
-
-# Files to ignore
-sim_population_tc.R
-wasted_votes_analysis_may30.R
-02_run_er_ei.R
-03_prepare_results.R
-03b_prepare_precinct_results.R
-04_make_tables.R
-05_make_figures.R
-05b_make_precinct_figures.R
-
-# Built package
+# Built packages
 *.tar.gz
 *.tgz
-rpvsimulator_*.tar.gz
 
-# Catch all for large spatial data objects
-*.shp *.shx *.dbf *.prj *.cpg *.gpkg *.geoparquet *.parquet *.feather *.rds *.zip *.tif
+# Vignette builds
+# inst/doc
+vignettes/*.html
+vignettes/*.R
+/doc/
+Meta/
+
+# pkgdown site
+docs/
+reference/
+articles/
+
+# Diagnostic plots
+diagnostics/
+
+# Large data files
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.gpkg
+*.geoparquet
+*.parquet
+*.feather
+*.rds
+*.zip
+*.tif
+
+# Temporary files
+*~
+.Rapp.history
+/doc/
+inst/doc
