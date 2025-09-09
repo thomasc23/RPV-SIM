@@ -1,7 +1,0 @@
-TO-DO:
-
-Population Generation:
-- Test using real precinct input
-
-Ex Post Vote Models:
-- Vary true RPV, vote model after plans are drawn (enabled but not tested)

@@ -1,0 +1,148 @@
+## ----setup, include = FALSE---------------------------------------------------
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 12,
+  fig.height = 8,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(rpvsimulator)
+library(ggplot2)
+library(patchwork)
+library(sf)
+library(spdep)
+
+
+## -----------------------------------------------------------------------------
+df = create_population_data(
+    n_precincts = 2600,
+    seed = 1234
+)
+
+head(df)
+
+
+## -----------------------------------------------------------------------------
+
+df = add_baseline_votes(
+    df
+)
+
+head(df)
+
+
+## -----------------------------------------------------------------------------
+
+grid = create_realistic_grid(
+    n_precincts = nrow(df), 
+    n_centers = 5, 
+    bounds = c(0, 1000, 0, 1000), 
+    decay_rate = 15,
+    base_density = 0.10,
+    peak_multiplier = 10.00,
+    decay_power = 1.00,
+    center_radius = 10.00,
+    seed = 1234
+    )
+
+
+## -----------------------------------------------------------------------------
+
+library(ggplot2)
+library(patchwork)
+
+# Themes and maps
+theme_map = function() {
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 12)
+  )
+}
+
+# Scale functions (data mapping)
+scale_minority = function() {
+  scale_fill_gradient(
+    low = "lightgrey", 
+    high = "black",
+    labels = scales::percent, 
+    name = "% Min"
+  )
+}
+
+scale_dem_vote = function() {
+  scale_fill_gradient2(
+    low = "#D32F2F", 
+    mid = "#F5F5F5", 
+    high = "#1976D2",
+    midpoint = 0.5, 
+    labels = scales::percent, 
+    name = "Dem %"
+  )
+}
+
+# --- Low
+
+low = place_voters_on_map(
+    df,
+    grid,
+    segregation_level = 'low',
+    seed = 1234
+    )
+
+low_pm = ggplot(low) +
+  geom_sf(aes(fill = per_minority)) +
+  scale_minority() +
+  theme_map()
+
+low_dv = ggplot(low) +
+  geom_sf(aes(fill = dem_voteshare)) +
+  scale_dem_vote() +
+  theme_map()
+
+# --- Medium
+
+med = place_voters_on_map(
+    df,
+    grid,
+    segregation_level = 'medium',
+    seed = 1234
+    )
+
+med_pm = ggplot(med) +
+  geom_sf(aes(fill = per_minority)) +
+  scale_minority() +
+  theme_map()
+
+med_dv = ggplot(med) +
+  geom_sf(aes(fill = dem_voteshare)) +
+  scale_dem_vote() + 
+  theme_map()
+
+# --- High
+
+high = place_voters_on_map(
+    df,
+    grid,
+    segregation_level = 'high',
+    seed = 1234
+    )
+
+high_pm = ggplot(high) +
+  geom_sf(aes(fill = per_minority)) +
+  scale_minority() + 
+  theme_map()
+
+high_dv = ggplot(high) +
+  geom_sf(aes(fill = dem_voteshare)) +
+  scale_dem_vote() + 
+  theme_map()
+
+
+# Plot combined results
+low_pm + med_pm + high_pm + low_dv + med_dv + high_dv + plot_layout(nrow = 2, ncol  = 3)
+
+
+
