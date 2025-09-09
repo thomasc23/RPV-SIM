@@ -2,7 +2,7 @@
 title: "Generating Synthetic Redistricting Data"
 author: "Thomas Chamberlain"
 date: "September 8, 2025"
-output: rmarkdown::github_document
+output: github_document
 ---
 
 
