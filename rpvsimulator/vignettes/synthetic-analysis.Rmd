@@ -1,10 +1,31 @@
 ---
 title: "Generating Synthetic Redistricting Data"
 author: "Thomas Chamberlain"
-date: "September 8, 2025"
-output: github_document
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Generating Synthetic Redistricting Data}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
 ---
 
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 12,
+  fig.height = 8,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(rpvsimulator)
+library(ggplot2)
+library(patchwork)
+library(sf)
+library(spdep)
+
+```
 
 # 1. Generating a population of voters
 
