@@ -1,4 +1,5 @@
 # Synthetic data generation functions for rpvsimulator package
+# Uses canonical column names from constants.R
 
 #' Create city centers for grid generation
 #' @param n_centers number of city centers to create
@@ -129,35 +130,42 @@ create_precinct_boundaries = function(seed_points, bounds = c(0, 1000, 0, 1000))
   }
   
   vor_polys = vor_polys[!sapply(vor_polys, is.null)]
-  precincts = st_sf(
-    precinct_id = 1:length(vor_polys),
-    geometry = st_sfc(vor_polys),
+
+  # Create sf object with canonical column names
+  precincts_df <- data.frame(id = 1:length(vor_polys))
+  names(precincts_df) <- COL_NAMES$precinct_id
+  precincts = sf::st_sf(
+    precincts_df,
+    geometry = sf::st_sfc(vor_polys),
     crs = 3857
   )
-  precincts = st_make_valid(precincts)
-  precincts = st_buffer(precincts, 0)
-  
+  precincts = sf::st_make_valid(precincts)
+  precincts = sf::st_buffer(precincts, 0)
+
   # Create spatial points and find which precinct each seed falls in
-  seed_sf = st_as_sf(
+  seed_sf = sf::st_as_sf(
     seed_points,
     coords = c("x", "y"),
     crs = 3857,
     remove = FALSE
   )
-  seed_to_precinct_map = st_join(seed_sf, precincts, join = st_intersects)
-  
+  seed_to_precinct_map = sf::st_join(seed_sf, precincts, join = sf::st_intersects)
+
   # Extract just the data (no geometry) from the join result
-  seed_data = st_drop_geometry(seed_to_precinct_map)
-  
+  seed_data = sf::st_drop_geometry(seed_to_precinct_map)
+
   # Join the seed data to precincts
   precincts = precincts %>%
-    left_join(seed_data, by = "precinct_id")
-  
-  # Calculate derived fields
-  precincts$area = as.numeric(st_area(precincts))
-  precincts$urbanness = precincts$density / max(precincts$density, na.rm = TRUE)
-  precincts = precincts %>% rename(seed_x = x, seed_y = y)
-  
+    dplyr::left_join(seed_data, by = COL_NAMES$precinct_id)
+
+  # Calculate derived fields with canonical names
+  precincts$area = as.numeric(sf::st_area(precincts))
+  precincts[[COL_NAMES$urbanness]] = precincts$density / max(precincts$density, na.rm = TRUE)
+  precincts[[COL_NAMES$seed_x]] = precincts$x
+  precincts[[COL_NAMES$seed_y]] = precincts$y
+  precincts$x <- NULL
+  precincts$y <- NULL
+
   return(precincts)
 }
 
@@ -209,12 +217,15 @@ create_realistic_grid = function(n_precincts     = 2600,
   precincts = create_precinct_boundaries(seeds, bounds)
   cat("Created", nrow(precincts), "precincts\n")
   
-  # Calculate distance to nearest center
+  # Calculate distance to nearest center (using canonical column names)
   precincts$dist_to_center = NA
   precincts$nearest_center = NA
-  valid_precincts = !is.na(precincts$seed_x)
+  seed_x_col <- COL_NAMES$seed_x
+  seed_y_col <- COL_NAMES$seed_y
+  valid_precincts = !is.na(precincts[[seed_x_col]])
   for (i in which(valid_precincts)) {
-    distances = sqrt((precincts$seed_x[i] - centers$x)^2 + (precincts$seed_y[i] - centers$y)^2)
+    distances = sqrt((precincts[[seed_x_col]][i] - centers$x)^2 +
+                     (precincts[[seed_y_col]][i] - centers$y)^2)
     precincts$dist_to_center[i] = min(distances)
     precincts$nearest_center[i] = which.min(distances)
   }

@@ -1,49 +1,68 @@
 # Redistricting functions for rpvsimulator package
 
-#' Setup Python environment for redistricting analysis
-#' @param env_dir path to Python environment directory
-#' @return TRUE if setup successful
-setup_python_environment = function(env_dir = file.path(getwd(), "inst", "python", "recom_env")) {
-  message("Setting up Python environment...")
-  
-  # Create environment directory 
-  if (!dir.exists(env_dir)) {
-    dir.create(env_dir, recursive = TRUE)
-    
-    # Create virtual environment
-    if (.Platform$OS.type == "windows") {
-      message("Creating Python virtual environment on Windows...")
-      system2("python", c("-m", "venv", shQuote(env_dir)))
-    } else {
-      message("Creating Python virtual environment on Unix-like system...")
-      system2("python3", c("-m", "venv", shQuote(env_dir)))
+#' Setup Python environment for redistricting analysis using uv
+#'
+#' This function uses uv (https://docs.astral.sh/uv/) to manage the Python
+#' environment. uv sync will create the virtual environment and install
+#' all dependencies specified in pyproject.toml.
+#'
+#' @param project_dir path to the Python project directory (containing pyproject.toml)
+#' @return path to the Python executable (invisibly)
+#' @export
+setup_python_environment = function(project_dir = NULL) {
+  # Default to the inst/python directory in the package
+  if (is.null(project_dir)) {
+    project_dir = system.file("python", package = "rpvsimulator")
+    if (project_dir == "") {
+      # Fallback for development: use local inst/python
+      project_dir = file.path(getwd(), "inst", "python")
     }
-    
-    # Install required packages
-    if (.Platform$OS.type == "windows") {
-      pip_path = file.path(env_dir, "Scripts", "pip.exe")
-    } else {
-      pip_path = file.path(env_dir, "bin", "pip")
-    }
-    
-    message("Installing required Python packages...")
-    system2(pip_path, c("install", "gerrychain", "geopandas", "pandas", "numpy", "matplotlib", "tqdm", "sklearn"))
-    message("Python packages installed successfully.")
   }
-  
-  # Set the Python path 
+
+  venv_path = file.path(project_dir, ".venv")
+
+  # Check if uv is available
+  uv_check = suppressWarnings(system2("uv", "--version", stdout = TRUE, stderr = TRUE))
+  if (!is.null(attr(uv_check, "status")) && attr(uv_check, "status") != 0) {
+    stop(
+      "uv not found. Please install uv first:\n",
+      "  macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh\n",
+      "  or via Homebrew: brew install uv\n",
+      "  Windows: powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\""
+    )
+  }
+
+  # Run uv sync to create venv and install dependencies
+  # uv sync handles everything: creates .venv if needed, installs/updates deps
+  message("Syncing Python environment with uv...")
+  result = system2(
+    "uv", "sync",
+    stdout = TRUE,
+    stderr = TRUE,
+    env = c(paste0("UV_PROJECT_ENVIRONMENT=", venv_path)),
+    wait = TRUE
+  )
+
+  status = attr(result, "status")
+  if (!is.null(status) && status != 0) {
+    stop("uv sync failed:\n", paste(result, collapse = "\n"))
+  }
+
+  # Configure reticulate to use the venv
   if (.Platform$OS.type == "windows") {
-    python_env_path = file.path(env_dir, "Scripts", "python.exe")
+    python_path = file.path(venv_path, "Scripts", "python.exe")
   } else {
-    python_env_path = file.path(env_dir, "bin", "python")
+    python_path = file.path(venv_path, "bin", "python")
   }
-  
-  # Load reticulate and use the environment
-  library(reticulate)
-  use_python(python_env_path)
-  
-  message(paste("Python environment configured. Using:", python_env_path))
-  return(TRUE)
+
+  if (!file.exists(python_path)) {
+    stop("Python executable not found at: ", python_path)
+  }
+
+  reticulate::use_python(python_path, required = TRUE)
+
+  message("Python environment configured. Using: ", python_path)
+  invisible(python_path)
 }
 
 #' Run redistricting analysis using Python gerrychain

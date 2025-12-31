@@ -1,4 +1,170 @@
 # Vote modeling functions for rpvsimulator package
+# Uses canonical column names from constants.R
+
+# =============================================================================
+# WIN PROBABILITY MODEL
+# =============================================================================
+# These functions compute the probability that a party wins a district,
+# given precinct demographics and DGP parameters. The mapmaker uses these
+# when optimizing redistricting plans.
+
+#' Compute district-level win probability using Normal CDF
+#'
+#' Given precinct-level demographics and DGP parameters, compute the expected
+#' Democratic vote share and its variance for a district, then calculate
+#' P(R wins) = P(Dem share < 0.5) using Normal approximation.
+#'
+#' @param n_b Numeric vector of minority population by precinct in the district
+#' @param n_w Numeric vector of majority population by precinct in the district
+#' @param mu_b Expected minority Democratic voting probability, E[P(Dem|minority)]
+#' @param mu_w Expected majority Democratic voting probability, E[P(Dem|majority)]
+#' @param sigma2_b Variance of minority voting probability across precincts
+#' @param sigma2_w Variance of majority voting probability across precincts
+#' @param sigma_bw Covariance between minority and majority voting probabilities
+#' @return List with mean_dem_share, var_dem_share, p_rep_wins, p_dem_wins
+#' @export
+#' @examples
+#' \dontrun{
+#' # District with 3 precincts
+#' result <- compute_district_win_prob(
+#'   n_b = c(100, 200, 150),
+#'   n_w = c(400, 300, 350),
+#'   mu_b = 0.81, mu_w = 0.37,
+#'   sigma2_b = 0.01, sigma2_w = 0.09, sigma_bw = 0.01
+#' )
+#' result$p_dem_wins  # Probability Democrats win this district
+#' }
+compute_district_win_prob <- function(n_b, n_w, mu_b, mu_w,
+                                       sigma2_b, sigma2_w, sigma_bw) {
+  # Total district population
+  N_d <- sum(n_b) + sum(n_w)
+
+  if (N_d == 0) {
+    return(list(
+      mean_dem_share = NA_real_,
+      var_dem_share = NA_real_,
+      p_rep_wins = NA_real_,
+      p_dem_wins = NA_real_
+    ))
+  }
+
+  # Expected Democratic votes: sum over precincts of E[votes]
+  # E[votes_p] = n_b[p] * mu_b + n_w[p] * mu_w
+  exp_dem <- sum(n_b * mu_b + n_w * mu_w)
+  mean_dem_share <- exp_dem / N_d
+
+  # Cross-precinct variance (uncertainty about realized betas)
+  # Var(sum_p n_b[p]*beta_b[p] + n_w[p]*beta_w[p]) under independence across precincts
+  # = sum_p [ n_b[p]^2 * sigma2_b + n_w[p]^2 * sigma2_w + 2*n_b[p]*n_w[p]*sigma_bw ]
+  cross_var <- sum(n_b^2 * sigma2_b + n_w^2 * sigma2_w + 2 * n_b * n_w * sigma_bw)
+
+  # Within-precinct variance (expected binomial variance given beta)
+  # E[Var(X|beta)] = E[n*beta*(1-beta)] = n*(mu*(1-mu) - sigma2)
+  # This is the expected residual variance after accounting for beta uncertainty
+  within_var_b <- sum(n_b * (mu_b * (1 - mu_b) - sigma2_b))
+  within_var_w <- sum(n_w * (mu_w * (1 - mu_w) - sigma2_w))
+  within_var <- pmax(0, within_var_b + within_var_w)  # Ensure non-negative
+
+  # Total variance of Democratic votes
+  var_dem_votes <- cross_var + within_var
+
+  # Variance of Democratic vote share
+  var_dem_share <- var_dem_votes / N_d^2
+
+  # P(R wins) = P(Dem share < 0.5) using Normal CDF
+  sd_dem_share <- sqrt(pmax(1e-10, var_dem_share))
+  p_rep_wins <- stats::pnorm(0.5, mean = mean_dem_share, sd = sd_dem_share)
+  p_dem_wins <- 1 - p_rep_wins
+
+  list(
+    mean_dem_share = mean_dem_share,
+    var_dem_share = var_dem_share,
+    p_rep_wins = p_rep_wins,
+    p_dem_wins = p_dem_wins
+  )
+}
+
+
+#' Compute win probabilities for all districts in a plan
+#'
+#' Given precinct demographics and district assignments, compute the win
+#' probability for each district under the specified DGP parameters.
+#'
+#' @param precincts sf object or data frame with precinct demographics
+#' @param assignment Vector of district assignments (length = nrow(precincts))
+#' @param dgp_params List with mu_b, mu_w, sigma2_b, sigma2_w, sigma_bw
+#' @return Data frame with district-level statistics and win probabilities
+#' @export
+compute_plan_win_probs <- function(precincts, assignment, dgp_params) {
+  # Validate DGP parameters
+  validate_dgp_params(dgp_params)
+
+  # Get column names (handle both canonical and standardized)
+  precincts <- standardize_column_names(precincts, warn = FALSE)
+  n_min_col <- COL_NAMES$n_minority
+  n_maj_col <- COL_NAMES$n_majority
+
+  districts <- unique(assignment)
+
+  results <- lapply(districts, function(d) {
+    idx <- which(assignment == d)
+    n_b <- precincts[[n_min_col]][idx]
+    n_w <- precincts[[n_maj_col]][idx]
+
+    prob <- compute_district_win_prob(
+      n_b = n_b, n_w = n_w,
+      mu_b = dgp_params$mu_b,
+      mu_w = dgp_params$mu_w,
+      sigma2_b = dgp_params$sigma2_b,
+      sigma2_w = dgp_params$sigma2_w,
+      sigma_bw = dgp_params$sigma_bw
+    )
+
+    data.frame(
+      district_id = d,
+      n_precincts = length(idx),
+      total_pop = sum(n_b) + sum(n_w),
+      n_minority = sum(n_b),
+      n_majority = sum(n_w),
+      pct_minority = sum(n_b) / (sum(n_b) + sum(n_w)),
+      mean_dem_share = prob$mean_dem_share,
+      var_dem_share = prob$var_dem_share,
+      p_dem_wins = prob$p_dem_wins,
+      p_rep_wins = prob$p_rep_wins
+    )
+  })
+
+  do.call(rbind, results)
+}
+
+
+#' Compute expected seats for a redistricting plan
+#'
+#' Sums the win probabilities across all districts to get expected seat count.
+#'
+#' @param precincts sf object or data frame with precinct demographics
+#' @param assignment Vector of district assignments
+#' @param dgp_params List with DGP parameters
+#' @param party Either "democratic" or "republican"
+#' @return Expected number of seats for the specified party
+#' @export
+compute_expected_seats <- function(precincts, assignment, dgp_params,
+                                    party = c("democratic", "republican")) {
+  party <- match.arg(party)
+
+  plan_probs <- compute_plan_win_probs(precincts, assignment, dgp_params)
+
+  if (party == "democratic") {
+    sum(plan_probs$p_dem_wins, na.rm = TRUE)
+  } else {
+    sum(plan_probs$p_rep_wins, na.rm = TRUE)
+  }
+}
+
+
+# =============================================================================
+# SPATIAL FIELDS
+# =============================================================================
 
 #' Simulate spatial autoregressive (SAR) field
 #' @param sf_obj sf object with spatial data
@@ -499,6 +665,176 @@ simulate_rpv_sensitivity = function(precinct_data,
       metrics = metrics
     )
   }
-  
+
   return(results)
+}
+
+
+# =============================================================================
+# ELECTION SIMULATION (GROUND TRUTH GENERATION)
+# =============================================================================
+
+#' Simulate a single election with ground truth individual-level votes
+#'
+#' Given precinct demographics (n_minority, n_majority) and DGP parameters,
+#' simulate an election by:
+#' 1. Drawing precinct-specific voting probabilities (beta_b, beta_w) from the DGP
+#' 2. Drawing individual votes from binomial distributions
+#' 3. Storing both aggregate votes and ground-truth group-specific votes
+#'
+#' This function is called AFTER redistricting to generate realized elections
+#' that can be analyzed with EI/ER/MrP methods.
+#'
+#' @param precincts sf object or data frame with columns n_minority, n_majority
+#' @param dgp_params List with mu_b, mu_w, sigma2_b, sigma2_w, sigma_bw
+#' @param seed Random seed for reproducibility (NULL for no seeding)
+#' @return sf/data frame with added vote columns (votes_dem, votes_rep, etc.)
+#'   and ground truth columns (mu_minority, mu_majority)
+#' @export
+#' @examples
+#' \dontrun{
+#' # Simulate election with default Texas-like RPV
+#' election <- simulate_election(precincts, DEFAULT_DGP_PARAMS)
+#'
+#' # Compare ground truth to what EI would estimate
+#' mean(election$share_dem_minority)  # True minority Dem share
+#' }
+simulate_election <- function(precincts, dgp_params, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+
+  # Validate DGP parameters
+  validate_dgp_params(dgp_params)
+
+  # Standardize column names
+  precincts <- standardize_column_names(precincts, warn = FALSE)
+
+  n <- nrow(precincts)
+  n_b <- precincts[[COL_NAMES$n_minority]]
+  n_w <- precincts[[COL_NAMES$n_majority]]
+
+  # Build covariance matrix for (beta_b, beta_w)
+  Sigma <- matrix(c(
+    dgp_params$sigma2_b, dgp_params$sigma_bw,
+    dgp_params$sigma_bw, dgp_params$sigma2_w
+  ), nrow = 2)
+
+  # Draw precinct-specific voting probabilities from truncated MVN
+  betas <- tmvtnorm::rtmvnorm(
+    n = n,
+    mean = c(dgp_params$mu_b, dgp_params$mu_w),
+    sigma = Sigma,
+    lower = c(0, 0),
+    upper = c(1, 1)
+  )
+
+  beta_b <- betas[, 1]
+  beta_w <- betas[, 2]
+
+  # Simulate votes from binomial distributions
+  votes_dem_minority <- rbinom(n, size = n_b, prob = beta_b)
+  votes_dem_majority <- rbinom(n, size = n_w, prob = beta_w)
+  votes_rep_minority <- n_b - votes_dem_minority
+  votes_rep_majority <- n_w - votes_dem_majority
+
+  # Add to output
+  result <- precincts
+  result[[COL_NAMES$votes_dem_minority]] <- votes_dem_minority
+  result[[COL_NAMES$votes_dem_majority]] <- votes_dem_majority
+  result[[COL_NAMES$votes_dem]] <- votes_dem_minority + votes_dem_majority
+  result[[COL_NAMES$votes_rep_minority]] <- votes_rep_minority
+  result[[COL_NAMES$votes_rep_majority]] <- votes_rep_majority
+  result[[COL_NAMES$votes_rep]] <- votes_rep_minority + votes_rep_majority
+  result[[COL_NAMES$votes_total]] <- n_b + n_w
+
+  # Store realized probabilities (ground truth)
+  result[[COL_NAMES$mu_minority]] <- beta_b
+  result[[COL_NAMES$mu_majority]] <- beta_w
+
+  # Compute vote shares
+  result[[COL_NAMES$share_dem]] <- safe_div(
+    result[[COL_NAMES$votes_dem]],
+    result[[COL_NAMES$votes_total]]
+  )
+  result[[COL_NAMES$share_dem_minority]] <- safe_div(
+    votes_dem_minority, n_b
+  )
+  result[[COL_NAMES$share_dem_majority]] <- safe_div(
+    votes_dem_majority, n_w
+  )
+
+  result
+}
+
+
+#' Aggregate precinct-level election results to districts
+#'
+#' Given precinct-level election data and district assignments, aggregate
+#' votes and demographics to the district level.
+#'
+#' @param election_data sf object or data frame with precinct-level election results
+#' @param assignment Vector of district assignments (same length as election_data)
+#' @return Data frame with district-level aggregates
+#' @export
+aggregate_to_districts <- function(election_data, assignment) {
+  # Standardize column names
+  election_data <- standardize_column_names(election_data, warn = FALSE)
+
+  districts <- unique(assignment)
+
+  results <- lapply(districts, function(d) {
+    idx <- which(assignment == d)
+    subset_data <- election_data[idx, , drop = FALSE]
+
+    data.frame(
+      district_id = d,
+      n_precincts = length(idx),
+      total_pop = sum(subset_data[[COL_NAMES$total_pop]], na.rm = TRUE),
+      n_minority = sum(subset_data[[COL_NAMES$n_minority]], na.rm = TRUE),
+      n_majority = sum(subset_data[[COL_NAMES$n_majority]], na.rm = TRUE),
+      votes_dem = sum(subset_data[[COL_NAMES$votes_dem]], na.rm = TRUE),
+      votes_rep = sum(subset_data[[COL_NAMES$votes_rep]], na.rm = TRUE),
+      votes_dem_minority = sum(subset_data[[COL_NAMES$votes_dem_minority]], na.rm = TRUE),
+      votes_dem_majority = sum(subset_data[[COL_NAMES$votes_dem_majority]], na.rm = TRUE)
+    )
+  })
+
+  district_df <- do.call(rbind, results)
+
+  # Compute derived columns
+  district_df$pct_minority <- safe_div(district_df$n_minority, district_df$total_pop)
+  district_df$share_dem <- safe_div(district_df$votes_dem, district_df$votes_dem + district_df$votes_rep)
+  district_df$share_dem_minority <- safe_div(district_df$votes_dem_minority, district_df$n_minority)
+  district_df$share_dem_majority <- safe_div(district_df$votes_dem_majority, district_df$n_majority)
+  district_df$dem_wins <- as.integer(district_df$share_dem > 0.5)
+
+  district_df
+}
+
+
+#' Extract ground truth voting rates from election data
+#'
+#' Computes the "true" group-specific voting rates from simulated election data.
+#' These can be compared to EI/ER/MrP estimates.
+#'
+#' @param election_data sf object or data frame with simulated election results
+#' @return List with beta_minority and beta_majority (population-weighted averages)
+#' @export
+extract_ground_truth <- function(election_data) {
+  # Standardize column names
+  election_data <- standardize_column_names(election_data, warn = FALSE)
+
+  n_b <- election_data[[COL_NAMES$n_minority]]
+  n_w <- election_data[[COL_NAMES$n_majority]]
+  dem_min <- election_data[[COL_NAMES$votes_dem_minority]]
+  dem_maj <- election_data[[COL_NAMES$votes_dem_majority]]
+
+  # Population-weighted average voting rates
+  beta_minority <- sum(dem_min, na.rm = TRUE) / sum(n_b, na.rm = TRUE)
+  beta_majority <- sum(dem_maj, na.rm = TRUE) / sum(n_w, na.rm = TRUE)
+
+  list(
+    beta_minority = beta_minority,
+    beta_majority = beta_majority,
+    rpv_gap = beta_minority - beta_majority
+  )
 }

@@ -1,17 +1,26 @@
 # Real data processing functions for rpvsimulator package
+# Uses canonical column names from constants.R
 
 #' Prepare Texas shapefile for redistricting with EI-imposed group-specific votes
+#'
+#' This function processes Texas precinct data, allocating votes to racial groups
+#' and simulating group-specific voting behavior using EI priors. Output uses
+#' shapefile-compatible abbreviated column names unless `use_canonical_names = TRUE`.
+#'
 #' @param in_shapefile path to input shapefile
-#' @param out_shapefile path to output shapefile
+#' @param out_shapefile path to output shapefile (NULL to skip writing)
 #' @param ei_means EI hyperparameters (probability scale, truncated to [0,1])
 #' @param ei_sds EI standard deviations
 #' @param ei_corr EI correlation parameters
 #' @param seed random seed for reproducibility
 #' @param simplify_tolerance geometry simplification tolerance
+#' @param use_canonical_names if TRUE, return canonical column names; if FALSE (default),
+#'   use abbreviated names for shapefile compatibility
 #' @return sf object with EI-imposed group votes
+#' @export
 prepare_tx_for_redistricting = function(
     in_shapefile,
-    out_shapefile,
+    out_shapefile = NULL,
     # EI hyperparameters (probability scale, truncated to [0,1])
     ei_means = c(white = 0.35, black = 0.90, hisp = 0.65),
     ei_sds   = c(white = 0.3,  black = 0.10, hisp = 0.12),
@@ -19,7 +28,9 @@ prepare_tx_for_redistricting = function(
     # Randomness
     seed = 123,
     # Geometry simplification
-    simplify_tolerance = NA_real_
+    simplify_tolerance = NA_real_,
+    # Column naming
+    use_canonical_names = FALSE
 ) {
   stopifnot(file.exists(in_shapefile))
   set.seed(seed)
@@ -171,54 +182,75 @@ prepare_tx_for_redistricting = function(
   dem_share_exp = safe_div(v_white * p_white + v_black * p_black + v_hisp * p_hisp,
                           pmax(1L, pop_turnout))
   
-  # --- assemble output with shapefile-safe (<=10 char) names ---
-  
+  # --- assemble output ---
+  # Use canonical names from constants.R, then optionally abbreviate for shapefile
+
   out = sf1 %>%
     dplyr::mutate(
-      pct_id      = prec_id,
+      !!COL_NAMES$precinct_id := prec_id,
       orig_id     = VTDKEY,
-      pop         = pop_turnout,
+      !!COL_NAMES$total_pop := pop_turnout,
       # electorates + simulated votes
-      n_min       = n_min,
-      n_maj       = n_maj,
-      dem_v       = dem_sim,
-      rep_v       = rep_sim,
-      dem_v_min   = dem_min,
-      rep_v_min   = rep_min,
-      dem_v_maj   = dem_maj,
-      rep_v_maj   = rep_maj,
-      pct_min     = safe_div(n_min, pmax(1L, pop_turnout)),
-      dem_vsh     = safe_div(dem_sim, pmax(1L, pop_turnout)),  # overall Dem share
-      dem_vsh_1   = safe_div(dem_min, pmax(1L, n_min)),        # minority Dem share
-      dem_vsh_0   = safe_div(dem_maj, pmax(1L, n_maj)),        # majority Dem share
-      lshift      = logit_shift,                              # logit shift used
+      !!COL_NAMES$n_minority := n_min,
+      !!COL_NAMES$n_majority := n_maj,
+      !!COL_NAMES$votes_dem := dem_sim,
+      !!COL_NAMES$votes_rep := rep_sim,
+      !!COL_NAMES$votes_dem_minority := dem_min,
+      !!COL_NAMES$votes_rep_minority := rep_min,
+      !!COL_NAMES$votes_dem_majority := dem_maj,
+      !!COL_NAMES$votes_rep_majority := rep_maj,
+      !!COL_NAMES$pct_minority := safe_div(n_min, pmax(1L, pop_turnout)),
+      !!COL_NAMES$share_dem := safe_div(dem_sim, pmax(1L, pop_turnout)),
+      !!COL_NAMES$share_dem_minority := safe_div(dem_min, pmax(1L, n_min)),
+      !!COL_NAMES$share_dem_majority := safe_div(dem_maj, pmax(1L, n_maj)),
+      lshift      = logit_shift,
       dsh_obs     = dem_share_obs,
       dsh_exp     = dem_share_exp
     ) %>%
     dplyr::select(
-      pct_id, orig_id, pop,
-      n_min, n_maj,
-      dem_v, rep_v, dem_v_min, rep_v_min, dem_v_maj, rep_v_maj,
-      pct_min, dem_vsh, dem_vsh_1, dem_vsh_0,
-      lshift, dsh_obs, dsh_exp,
+      dplyr::all_of(c(
+        COL_NAMES$precinct_id, "orig_id", COL_NAMES$total_pop,
+        COL_NAMES$n_minority, COL_NAMES$n_majority,
+        COL_NAMES$votes_dem, COL_NAMES$votes_rep,
+        COL_NAMES$votes_dem_minority, COL_NAMES$votes_rep_minority,
+        COL_NAMES$votes_dem_majority, COL_NAMES$votes_rep_majority,
+        COL_NAMES$pct_minority, COL_NAMES$share_dem,
+        COL_NAMES$share_dem_minority, COL_NAMES$share_dem_majority,
+        "lshift", "dsh_obs", "dsh_exp"
+      )),
       geometry
     )
-  
+
   # Optional simplify
   if (!is.na(simplify_tolerance) && is.finite(simplify_tolerance) && simplify_tolerance > 0) {
     out = sf::st_simplify(out, dTolerance = simplify_tolerance, preserveTopology = TRUE)
     out = sf::st_make_valid(out)
   }
-  
-  dir.create(dirname(out_shapefile), recursive = TRUE, showWarnings = FALSE)
-  sf::st_write(out, out_shapefile, append = FALSE, quiet = TRUE)
-  
-  # Integrity (internal consistency of simulated outputs)
-  stopifnot(sum(out$dem_v + out$rep_v) == sum(pop_turnout))
-  stopifnot(all(out$dem_v == out$dem_v_min + out$dem_v_maj))
-  stopifnot(all(out$rep_v == out$rep_v_min + out$rep_v_maj))
-  
-  message("Wrote shapefile with EI-imposed group votes (logit pre-shift; no hard adjust): ", out_shapefile)
+
+  # Integrity checks (using canonical names)
+  dem_col <- COL_NAMES$votes_dem
+  rep_col <- COL_NAMES$votes_rep
+  dem_min_col <- COL_NAMES$votes_dem_minority
+  dem_maj_col <- COL_NAMES$votes_dem_majority
+  rep_min_col <- COL_NAMES$votes_rep_minority
+  rep_maj_col <- COL_NAMES$votes_rep_majority
+
+  stopifnot(sum(out[[dem_col]] + out[[rep_col]]) == sum(pop_turnout))
+  stopifnot(all(out[[dem_col]] == out[[dem_min_col]] + out[[dem_maj_col]]))
+  stopifnot(all(out[[rep_col]] == out[[rep_min_col]] + out[[rep_maj_col]]))
+
+  # Abbreviate column names for shapefile compatibility if needed
+  if (!use_canonical_names) {
+    out <- abbreviate_column_names(out)
+  }
+
+  # Write shapefile if path provided
+ if (!is.null(out_shapefile)) {
+    dir.create(dirname(out_shapefile), recursive = TRUE, showWarnings = FALSE)
+    sf::st_write(out, out_shapefile, append = FALSE, quiet = TRUE)
+    message("Wrote shapefile with EI-imposed group votes: ", out_shapefile)
+  }
+
   invisible(out)
 }
 
